@@ -108,7 +108,10 @@ export const ALL: APIRoute = async ({ request, url }) => {
   // Behind-the-scenes account-id injection for `execute` tool calls. Only bodies
   // that carry a request (POST) and only when the account id is configured.
   let forwardedBody: BodyInit | null | undefined = request.body
-  const accountId = await env.CLOUDFLARE_ACCOUNT_ID.get()
+  // A missing/rotated secret or a transient store error must not 500 the whole
+  // proxy — account injection is an enhancement, not load-bearing. Fall back to
+  // no injection on any failure.
+  const accountId = await env.CLOUDFLARE_ACCOUNT_ID.get().catch(() => null)
   if (accountId && request.method === 'POST' && request.body) {
     const rewritten = injectAccountId(await request.text(), accountId)
     forwardedBody = rewritten
