@@ -1,108 +1,174 @@
 import OAuthProvider, {
-  getOAuthApi,
+  type AuthRequest,
+  type OAuthHelpers,
   type OAuthProviderOptions
 } from '@cloudflare/workers-oauth-provider'
-import { createAuthHandlers, handleTokenExchangeCallback } from './auth/oauth-handler'
-import { resolveExternalToken } from './auth/api-token-mode'
-import {
-  MCP_ROUTE,
-  handleMcpPreflight,
-  oauthMcpHandler,
-  rejectInvalidMcpRequest
-} from './mcp-handler'
-import { processSpec, extractProducts } from './spec-processor'
-import { buildNonCodemodeTools, type OperationInfo } from './openapi'
+import { Hono } from 'hono'
 
-// GlobalOutbound lives with the execute tool (its only caller); wrangler
-// resolves the GLOBAL_OUTBOUND worker-loader entrypoint from this entry module,
-// so it must be re-exported here.
-export { GlobalOutbound } from './tools/execute'
+type AppEnv = Env & {
+  OAUTH_PROVIDER: OAuthHelpers
+}
+
+const DEFAULT_UPSTREAM = 'https://mcp.cloudflare.com/mcp'
+const MCP_ROUTE = '/mcp'
+const ONE_YEAR_IN_SECONDS = 31_536_000 // 365 days
+
+function createOAuthBackend() {
+  const app = new Hono<{ Bindings: AppEnv }>()
+
+  // Handle OAuth /authorize request parsing & UI routing
+  app.get('/authorize', async (c) => {
+    try {
+      const oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw)
+      const client = await c.env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId)
+      const clientName = client?.clientName || 'Claude MCP Client'
+      const statePayload = JSON.stringify(oauthReqInfo)
+
+      const redirectUrl = new URL('/authorize', c.req.url)
+      redirectUrl.searchParams.set('client_name', clientName)
+      redirectUrl.searchParams.set('state', statePayload)
+
+      return new Response(null, {
+        status: 302,
+        headers: { Location: redirectUrl.toString() }
+      })
+    } catch (err) {
+      console.error('Error parsing auth request:', err)
+      return c.text('Invalid authorization request parameters.', 400)
+    }
+  })
+
+  // Handle OAuth /authorize form submission & key verification
+  app.post('/authorize', async (c) => {
+    try {
+      const body = await c.req.parseBody()
+      const apiKey = typeof body['apiKey'] === 'string' ? body['apiKey'].trim() : ''
+      const statePayload = typeof body['state'] === 'string' ? body['state'] : ''
+
+      if (!statePayload) {
+        return c.text('Missing OAuth session state.', 400)
+      }
+
+      let oauthReqInfo: AuthRequest
+      try {
+        oauthReqInfo = JSON.parse(statePayload) as AuthRequest
+      } catch {
+        return c.text('Invalid session state format.', 400)
+      }
+
+      const expectedApiKey = await c.env.WORKER_API_KEY.get()
+      if (!expectedApiKey || apiKey !== expectedApiKey) {
+        const client = await c.env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId)
+        const clientName = client?.clientName || 'Claude MCP Client'
+
+        const retryUrl = new URL('/authorize', c.req.url)
+        retryUrl.searchParams.set('client_name', clientName)
+        retryUrl.searchParams.set('state', statePayload)
+        retryUrl.searchParams.set('error', 'Invalid Worker API Key. Please try again.')
+
+        return new Response(null, {
+          status: 302,
+          headers: { Location: retryUrl.toString() }
+        })
+      }
+
+      // Complete authorization with 1-year grant
+      const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
+        request: oauthReqInfo,
+        userId: 'admin',
+        metadata: { label: 'Claude MCP User' },
+        scope: oauthReqInfo.scope ?? [],
+        props: { authorized: true }
+      })
+
+      return new Response(null, {
+        status: 302,
+        headers: { Location: redirectTo }
+      })
+    } catch (err) {
+      console.error('Error completing authorization:', err)
+      return c.text('Failed to complete authorization.', 500)
+    }
+  })
+
+  return app
+}
+
+/** Proxy handler for authenticated /mcp calls */
+const mcpProxyHandler = {
+  async fetch(request: Request, env: AppEnv, _ctx: ExecutionContext): Promise<Response> {
+    const cfApiToken = await env.CLOUDFLARE_WRANGLER_API_TOKEN.get()
+    if (!cfApiToken) {
+      return new Response(
+        JSON.stringify({ error: 'CLOUDFLARE_WRANGLER_API_TOKEN secret is not configured' }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } }
+      )
+    }
+
+    const incomingUrl = new URL(request.url)
+    const upstreamBase = env.UPSTREAM_MCP_URL || DEFAULT_UPSTREAM
+    const targetUrl = new URL(upstreamBase)
+    targetUrl.search = incomingUrl.search
+
+    const forwardedHeaders = new Headers(request.headers)
+    forwardedHeaders.set('Host', targetUrl.hostname)
+    forwardedHeaders.set('Authorization', `Bearer ${cfApiToken}`)
+
+    try {
+      const upstreamResponse = await fetch(targetUrl.toString(), {
+        method: request.method,
+        headers: forwardedHeaders,
+        body: request.body,
+        redirect: 'follow'
+      })
+
+      const responseHeaders = new Headers(upstreamResponse.headers)
+      const origin = request.headers.get('Origin')
+      if (origin) {
+        responseHeaders.set('Access-Control-Allow-Origin', origin)
+        responseHeaders.set('Vary', 'Origin')
+      }
+
+      return new Response(upstreamResponse.body, {
+        status: upstreamResponse.status,
+        statusText: upstreamResponse.statusText,
+        headers: responseHeaders
+      })
+    } catch (err) {
+      console.error('Failed to proxy request to upstream MCP:', err)
+      return new Response(
+        JSON.stringify({
+          error: 'Upstream MCP proxy failed',
+          details: err instanceof Error ? err.message : String(err)
+        }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } }
+      )
+    }
+  }
+}
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: AppEnv, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
-    const isMcpRoute = url.pathname === MCP_ROUTE
-    if (url.pathname.startsWith(MCP_ROUTE) && !isMcpRoute) {
-      return new Response('Not Found', { status: 404 })
-    }
-    if (isMcpRoute) {
-      // Validate Host and browser Origin before authentication so an invalid
-      // request cannot spend a bearer token on Cloudflare API identity probes.
-      const rejected = rejectInvalidMcpRequest(request)
-      if (rejected) return rejected
-      if (request.method === 'OPTIONS') return handleMcpPreflight(request)
-    }
 
-    // workers-oauth-provider resolves its own access tokens first, then delegates
-    // direct Cloudflare API/OAuth credentials to resolveExternalToken.
-    const oauthOptions: OAuthProviderOptions<Env> = {
+    const oauthOptions: OAuthProviderOptions<AppEnv> = {
       apiHandlers: {
-        [MCP_ROUTE]: oauthMcpHandler
+        [MCP_ROUTE]: mcpProxyHandler
       },
-      defaultHandler: createAuthHandlers(),
+      defaultHandler: createOAuthBackend(),
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/token',
       clientRegistrationEndpoint: '/register',
       clientIdMetadataDocumentEnabled: true,
-      resolveExternalToken,
-      tokenExchangeCallback: (options) =>
-        handleTokenExchangeCallback(
-          options,
-          env.CLOUDFLARE_CLIENT_ID,
-          env.CLOUDFLARE_CLIENT_SECRET,
-          // Lazily build helpers (only invoked on terminal invalid_grant) so we
-          // can revoke the dead grant. env.OAUTH_PROVIDER is NOT injected during
-          // the token endpoint, so we must construct the API explicitly here.
-          () => getOAuthApi(oauthOptions, env)
-        ),
       resourceMetadata: {
-        resource: env.MCP_RESOURCE,
+        resource: `${url.origin}${MCP_ROUTE}`,
         resource_name: 'Cloudflare API MCP Server'
       },
-      accessTokenTTL: 3600,
-      refreshTokenTTL: 2592000, // 30 days
-      // TODO: Remove after 2026-05-01 — all pre-0.4.0 grants will have expired by then
-      resourceMatchOriginOnly: true
+      accessTokenTTL: ONE_YEAR_IN_SECONDS, // 1 year
+      refreshTokenTTL: ONE_YEAR_IN_SECONDS, // 1 year
+      clientRegistrationTTL: undefined // Persistent client registrations
     }
+
     return new OAuthProvider(oauthOptions).fetch(request, env, ctx)
-  },
-
-  async scheduled(
-    _controller: ScheduledController,
-    env: Env,
-    _ctx: ExecutionContext
-  ): Promise<void> {
-    console.log('Fetching OpenAPI spec from:', env.OPENAPI_SPEC_URL)
-
-    const response = await fetch(env.OPENAPI_SPEC_URL)
-    if (!response.ok) {
-      throw new Error(`Failed to fetch OpenAPI spec: ${response.status}`)
-    }
-
-    const rawSpec = (await response.json()) as Record<string, unknown>
-    console.log('Processing spec, resolving $refs...')
-
-    const processed = processSpec(rawSpec)
-    const specJson = JSON.stringify(processed)
-
-    const products = extractProducts(rawSpec)
-    const productsJson = JSON.stringify(products)
-    const paths = (processed as { paths: Record<string, Record<string, OperationInfo>> }).paths
-    const nonCodemodeToolsJson = JSON.stringify(buildNonCodemodeTools(paths))
-
-    console.log(`Writing spec to R2 (${(specJson.length / 1024).toFixed(0)} KB)`)
-    await Promise.all([
-      env.SPEC_BUCKET.put('spec.json', specJson, {
-        httpMetadata: { contentType: 'application/json' }
-      }),
-      env.SPEC_BUCKET.put('products.json', productsJson, {
-        httpMetadata: { contentType: 'application/json' }
-      }),
-      env.SPEC_BUCKET.put('non-codemode-tools.json', nonCodemodeToolsJson, {
-        httpMetadata: { contentType: 'application/json' }
-      })
-    ])
-
-    console.log(`Spec updated successfully (${products.length} products)`)
   }
 }

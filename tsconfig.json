@@ -3,16 +3,27 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2022"],
-    "types": ["./worker-configuration.d.ts", "@cloudflare/vitest-pool-workers/types"],
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
     "strict": true,
     "skipLibCheck": true,
-    "noEmit": true,
-    "isolatedModules": true,
-    "allowSyntheticDefaultImports": true,
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true
+    "allowJs": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "react",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+    "types": [
+      "./worker-configuration.d.ts"
+    ]
   },
-  "include": ["src/**/*", "tests/**/*", "worker-configuration.d.ts"]
+  "include": [
+    ".astro/types.d.ts",
+    "worker-configuration.d.ts",
+    "src/**/*",
+    "tests/**/*"
+  ],
+  "exclude": ["dist", "node_modules"]
 }
