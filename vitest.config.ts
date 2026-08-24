@@ -6,20 +6,14 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: './wrangler.jsonc' },
       miniflare: {
-        // Deterministic test secrets so tests never depend on a local .env
-        // (which CI doesn't have). These are dummy values, not real secrets.
         bindings: {
-          MCP_COOKIE_ENCRYPTION_KEY: 'test-cookie-encryption-key-0000000000000000',
-          CLOUDFLARE_CLIENT_ID: 'test-client-id',
-          CLOUDFLARE_CLIENT_SECRET: 'test-client-secret',
-          MCP_RESOURCE: 'https://mcp.cloudflare.com/mcp'
+          UPSTREAM_MCP_URL: 'https://mcp.cloudflare.com/mcp'
         }
       }
     })
   ],
   test: {
     globals: true,
-    include: ['tests/**/*.test.ts'],
-    setupFiles: ['./tests/setup/msw.ts']
+    include: ['tests/**/*.test.ts']
   }
 })

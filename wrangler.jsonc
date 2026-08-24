@@ -1,164 +1,53 @@
 {
-	"$schema": "./node_modules/wrangler/config-schema.json",
-	"name": "cloudflare-api-mcp-dev",
-	"account_id": "6702657b6aa048cf3081ff3ff3c9c52f",
-	"main": "src/index.ts",
-	"compatibility_date": "2026-01-12",
-	"compatibility_flags": [
-		"nodejs_compat",
-		"global_fetch_strictly_public"
-	],
-	"observability": {
-		"logs": {
-			"enabled": true
-		},
-		"traces": {
-			"enabled": true
-		}
-	},
-	"vars": {
-		"CLOUDFLARE_API_BASE": "https://api.cloudflare.com/client/v4",
-		"CLOUDFLARE_OAUTH_DOMAIN": "https://dash.cloudflare.com",
-		"MCP_RESOURCE": "http://localhost:2529/mcp",
-		"OPENAPI_SPEC_URL": "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json"
-	},
-	"worker_loaders": [
-		{
-			"binding": "LOADER"
-		}
-	],
-	"services": [
-		{
-			"binding": "GLOBAL_OUTBOUND",
-			"service": "cloudflare-api-mcp-dev",
-			"entrypoint": "GlobalOutbound"
-		}
-	],
-	"kv_namespaces": [
-		{
-			"binding": "OAUTH_KV",
-		}
-	],
-	"r2_buckets": [
-		{
-			"binding": "SPEC_BUCKET",
-			"bucket_name": "mcp-spec"
-		}
-	],
-	"analytics_engine_datasets": [
-		{
-			"binding": "MCP_METRICS",
-			"dataset": "mcp-metrics-dev"
-		}
-	],
-	"triggers": {
-		"crons": ["0 0 * * *"]
-	},
-	"dev": {
-		"port": 2529
-	},
-	"env": {
-		"staging": {
-			"name": "cloudflare-api-mcp-staging",
-			"ai": {
-				"binding": "AI"
-			},
-			"routes": [
-				{
-					"pattern": "staging.mcp.cloudflare.com",
-					"custom_domain": true
-				}
-			],
-			"worker_loaders": [
-				{
-					"binding": "LOADER"
-				}
-			],
-			"services": [
-				{
-					"binding": "GLOBAL_OUTBOUND",
-					"service": "cloudflare-api-mcp-staging",
-					"entrypoint": "GlobalOutbound"
-				}
-			],
-			"kv_namespaces": [
-				{
-					"binding": "OAUTH_KV",
-					"id":"cd658e2801ac4ae6b18082e375f176a3"
-				}
-			],
-			"r2_buckets": [
-				{
-					"binding": "SPEC_BUCKET",
-					"bucket_name": "mcp-spec-staging"
-				}
-			],
-			"analytics_engine_datasets": [
-				{
-					"binding": "MCP_METRICS",
-					"dataset": "mcp-metrics-staging"
-				}
-			],
-			"triggers": {
-				"crons": ["0 0 * * *"]
-			},
-			"vars": {
-				"CLOUDFLARE_API_BASE": "https://api.staging.cloudflare.com/client/v4",
-				"CLOUDFLARE_OAUTH_DOMAIN": "https://dash.staging.cloudflare.com",
-				"MCP_RESOURCE": "https://staging.mcp.cloudflare.com/mcp",
-				"OPENAPI_SPEC_URL": "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json"
-			}
-		},
-		"production": {
-			"name": "cloudflare-api-mcp",
-			"ai": {
-				"binding": "AI"
-			},
-			"routes": [
-				{
-					"pattern": "mcp.cloudflare.com",
-					"custom_domain": true
-				}
-			],
-			"worker_loaders": [
-				{
-					"binding": "LOADER"
-				}
-			],
-			"services": [
-				{
-					"binding": "GLOBAL_OUTBOUND",
-					"service": "cloudflare-api-mcp",
-					"entrypoint": "GlobalOutbound"
-				}
-			],
-			"kv_namespaces": [
-				{
-					"binding": "OAUTH_KV",
-					"id": "c7d4e4f11dfe41e6a22228aa838a14f1"
-				}
-			],
-			"r2_buckets": [
-				{
-					"binding": "SPEC_BUCKET",
-					"bucket_name": "mcp-spec-production"
-				}
-			],
-			"analytics_engine_datasets": [
-				{
-					"binding": "MCP_METRICS",
-					"dataset": "mcp-metrics-production"
-				}
-			],
-			"triggers": {
-				"crons": ["0 0 * * *"]
-			},
-			"vars": {
-				"CLOUDFLARE_API_BASE": "https://api.cloudflare.com/client/v4",
-				"CLOUDFLARE_OAUTH_DOMAIN": "https://dash.cloudflare.com",
-				"MCP_RESOURCE": "https://mcp.cloudflare.com/mcp",
-				"OPENAPI_SPEC_URL": "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json"
-			}
-		}
-	}
+  "name": "cloudflare-api-mcp",
+  "compatibility_date": "2026-01-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "logs": {
+      "enabled": true
+    },
+    "traces": {
+      "enabled": true
+    }
+  },
+  "vars": {
+    "UPSTREAM_MCP_URL": "https://mcp.cloudflare.com/mcp"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SESSION",
+      "id": "3cb4a3cded1141579db392c7712a9f16",
+      "remote": true
+    },
+    {
+      "binding": "OAUTH_KV",
+      "id": "fe5df5570a674ab28a0d893a34bcfe0b",
+      "remote": true
+    }
+  ],
+  "secrets_store_secrets": [
+    {
+      "binding": "WORKER_API_KEY",
+      "store_id": "8c42fa70938644e0a8a109744467375f",
+      "secret_name": "WORKER_API_KEY"
+    },
+    {
+      "binding": "CLOUDFLARE_WRANGLER_API_TOKEN",
+      "store_id": "8c42fa70938644e0a8a109744467375f",
+      "secret_name": "CLOUDFLARE_WRANGLER_API_TOKEN"
+    },
+    {
+      "binding": "REUI_LICENSE_KEY",
+      "store_id": "8c42fa70938644e0a8a109744467375f",
+      "secret_name": "REUI_LICENSE_KEY"
+    },
+    {
+      "binding": "CLOUDFLARE_ACCOUNT_ID",
+      "store_id": "8c42fa70938644e0a8a109744467375f",
+      "secret_name": "CLOUDFLARE_ACCOUNT_ID"
+    }
+  ],
+  "dev": {
+    "port": 2529
+  }
 }

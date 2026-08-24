@@ -1,0 +1,10 @@
+---
+import Layout from '../layouts/Layout.astro'
+import { LandingPage } from '../components/LandingPage'
+
+export const prerender = false
+---
+
+<Layout title="Cloudflare MCP Gateway — Universal API Bridge for AI Agents">
+  <LandingPage client:load />
+</Layout>
