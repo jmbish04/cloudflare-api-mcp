@@ -69,9 +69,8 @@ export const ALL: APIRoute = async ({ request, url }) => {
   }
 
   // Check if client is authenticated
-  const authHeader = request.headers.get('Authorization')
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return new Response(
+  const unauthorized = () =>
+    new Response(
       JSON.stringify({
         error: 'unauthorized',
         message: 'Authentication required. Please authenticate via OAuth 2.1.'
@@ -87,6 +86,19 @@ export const ALL: APIRoute = async ({ request, url }) => {
         }
       }
     )
+
+  const authHeader = request.headers.get('Authorization')
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return unauthorized()
+  }
+
+  // Validate the presented bearer against WORKER_API_KEY before handing the
+  // privileged upstream token to the request. Without this, any bearer would
+  // proxy with our Cloudflare API token. Review finding #2.
+  const workerApiKey = await env.WORKER_API_KEY.get()
+  const presentedToken = authHeader.slice('Bearer '.length).trim()
+  if (!workerApiKey || presentedToken !== workerApiKey) {
+    return unauthorized()
   }
 
   const cfApiToken = await env?.CLOUDFLARE_WRANGLER_API_TOKEN?.get?.()
