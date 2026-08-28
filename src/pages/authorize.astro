@@ -2,6 +2,7 @@
 import Layout from '../layouts/Layout.astro'
 import { AuthorizePage } from '../components/AuthorizePage'
 import { env } from 'cloudflare:workers'
+import { DEFAULT_REDIRECT_URIS, SUPPORTED_PKCE_METHOD, isAllowedRedirectUri } from '../lib/oauth'
 
 export const prerender = false
 
@@ -24,6 +25,8 @@ if (Astro.request.method === 'POST') {
         state?: string
         responseType?: string
         scope?: string[]
+        codeChallenge?: string
+        codeChallengeMethod?: string
       }
       try {
         oauthReqInfo = JSON.parse(statePayload)
@@ -44,30 +47,58 @@ if (Astro.request.method === 'POST') {
           }
           errorMessage = 'Invalid Worker API Key. Please try again.'
         } else {
-          // Direct OAuth code redirect for 1-year persistent grant
-          const targetRedirectUri =
-            oauthReqInfo.redirectUri || 'https://claude.ai/api/mcp/oauth_callback'
-          const redirectUrl = new URL(targetRedirectUri)
-          const authCode = `auth_${crypto.randomUUID().replace(/-/g, '')}`
+          // API key verified. Before minting a code, enforce the two bindings
+          // that keep a phished consent from leaking a privileged token:
+          //   1. redirect_uri must belong to the client (registered URIs, else
+          //      the built-in defaults) — the code can only reach a known dest.
+          //   2. PKCE with S256 is mandatory — /token refuses codes without it.
+          const targetRedirectUri = oauthReqInfo.redirectUri || DEFAULT_REDIRECT_URIS[0]
 
-          // Store auth code in KV for /token exchange
-          if (env.OAUTH_KV) {
-            await env.OAUTH_KV.put(
-              `code:${authCode}`,
-              JSON.stringify({
-                clientId: oauthReqInfo.clientId,
-                redirectUri: targetRedirectUri,
-                issuedAt: Date.now()
-              }),
-              { expirationTtl: 600 }
-            )
+          let registeredUris: string[] | undefined
+          if (oauthReqInfo.clientId && env.OAUTH_KV) {
+            const clientJson = await env.OAUTH_KV.get(`client:${oauthReqInfo.clientId}`)
+            if (clientJson) {
+              try {
+                registeredUris = JSON.parse(clientJson).redirect_uris
+              } catch {
+                registeredUris = undefined
+              }
+            }
           }
 
-          redirectUrl.searchParams.set('code', authCode)
-          if (oauthReqInfo.state) {
-            redirectUrl.searchParams.set('state', oauthReqInfo.state)
+          if (!isAllowedRedirectUri(targetRedirectUri, registeredUris)) {
+            errorMessage = 'Invalid redirect_uri for this client.'
+          } else if (
+            !oauthReqInfo.codeChallenge ||
+            (oauthReqInfo.codeChallengeMethod || SUPPORTED_PKCE_METHOD) !== SUPPORTED_PKCE_METHOD
+          ) {
+            errorMessage = 'This authorization request must use PKCE with S256.'
+          } else {
+            const redirectUrl = new URL(targetRedirectUri)
+            const authCode = `auth_${crypto.randomUUID().replace(/-/g, '')}`
+
+            // Store auth code in KV for /token exchange. The PKCE challenge is
+            // carried through so /token can verify the client's code_verifier.
+            if (env.OAUTH_KV) {
+              await env.OAUTH_KV.put(
+                `code:${authCode}`,
+                JSON.stringify({
+                  clientId: oauthReqInfo.clientId,
+                  redirectUri: targetRedirectUri,
+                  codeChallenge: oauthReqInfo.codeChallenge,
+                  codeChallengeMethod: SUPPORTED_PKCE_METHOD,
+                  issuedAt: Date.now()
+                }),
+                { expirationTtl: 600 }
+              )
+            }
+
+            redirectUrl.searchParams.set('code', authCode)
+            if (oauthReqInfo.state) {
+              redirectUrl.searchParams.set('state', oauthReqInfo.state)
+            }
+            return Astro.redirect(redirectUrl.toString(), 302)
           }
-          return Astro.redirect(redirectUrl.toString(), 302)
         }
       }
     }
@@ -84,12 +115,17 @@ if (Astro.request.method === 'POST') {
     const state = params.get('state') || ''
     const responseType = params.get('response_type') || 'code'
     const scope = (params.get('scope') || 'read write').split(' ').filter(Boolean)
+    const codeChallenge = params.get('code_challenge') || ''
+    const codeChallengeMethod =
+      params.get('code_challenge_method') || (codeChallenge ? 'S256' : '')
 
+    let registeredUris: string[] | undefined
     if (env.OAUTH_KV && clientId) {
       const clientJson = await env.OAUTH_KV.get(`client:${clientId}`)
       if (clientJson) {
         const client = JSON.parse(clientJson)
         clientName = client.client_name || clientId
+        registeredUris = client.redirect_uris
       } else {
         clientName = params.get('client_name') || 'Claude MCP Client'
       }
@@ -102,9 +138,20 @@ if (Astro.request.method === 'POST') {
       redirectUri,
       state,
       responseType,
-      scope
+      scope,
+      codeChallenge,
+      codeChallengeMethod
     }
     statePayload = JSON.stringify(oauthReqInfo)
+
+    // Fail fast (before showing a consent form) on requests the POST would
+    // reject anyway: an unregistered redirect_uri, or a missing/non-S256 PKCE
+    // challenge. The POST path re-validates as the authoritative gate.
+    if (!isAllowedRedirectUri(redirectUri, registeredUris)) {
+      errorMessage = 'Invalid redirect_uri for this client.'
+    } else if (!codeChallenge || codeChallengeMethod !== SUPPORTED_PKCE_METHOD) {
+      errorMessage = 'This authorization request must use PKCE with S256.'
+    }
   } catch (err) {
     console.error('Error parsing auth request:', err)
     errorMessage = 'Invalid authorization request parameters.'

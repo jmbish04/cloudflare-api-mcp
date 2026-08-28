@@ -1,9 +1,8 @@
 import type { APIRoute } from 'astro'
 import { env } from 'cloudflare:workers'
+import { handleTokenRequest } from '../lib/token-grants'
 
 export const prerender = false
-
-const ONE_YEAR_IN_SECONDS = 31_536_000 // 365 days
 
 export const OPTIONS: APIRoute = async () => {
   return new Response(null, {
@@ -30,41 +29,5 @@ export const POST: APIRoute = async ({ request }) => {
     bodyParams = (await request.json().catch(() => ({}))) as Record<string, string>
   }
 
-  const token = `mcp_at_${crypto.randomUUID().replace(/-/g, '')}`
-  const refreshToken = `mcp_rt_${crypto.randomUUID().replace(/-/g, '')}`
-
-  // Cache token in KV
-  if (env?.OAUTH_KV) {
-    try {
-      await env.OAUTH_KV.put(
-        `token:${token}`,
-        JSON.stringify({
-          active: true,
-          issued_at: Date.now(),
-          client_id: bodyParams['client_id'] || 'claude'
-        }),
-        { expirationTtl: ONE_YEAR_IN_SECONDS }
-      )
-    } catch (err) {
-      console.warn('Could not persist token to KV:', err)
-    }
-  }
-
-  return new Response(
-    JSON.stringify({
-      access_token: token,
-      token_type: 'Bearer',
-      expires_in: ONE_YEAR_IN_SECONDS,
-      refresh_token: refreshToken,
-      scope: 'read write'
-    }),
-    {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-store',
-        'Access-Control-Allow-Origin': '*'
-      }
-    }
-  )
+  return handleTokenRequest(bodyParams, env?.OAUTH_KV)
 }
