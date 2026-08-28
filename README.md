@@ -1,205 +1,87 @@
-# Cloudflare MCP Server
+# Cloudflare API MCP — Authenticated Proxy
 
-> A token-efficient MCP server for the entire Cloudflare API. 2500 endpoints in 1k tokens, powered by [Code Mode](https://blog.cloudflare.com/code-mode-mcp/).
+A self-hosted Cloudflare Worker (Astro SSR) that puts your **own OAuth front door** in front of Cloudflare's [Code Mode](https://blog.cloudflare.com/code-mode-mcp/) MCP server (`mcp.cloudflare.com/mcp`).
 
-## Token Comparison
+Instead of handing an MCP client your raw Cloudflare API token, you connect the client to **your** worker. The worker authenticates the client (OAuth 2.1 with PKCE, gated by a shared `WORKER_API_KEY`), then forwards MCP traffic upstream using a privileged Cloudflare token that **never leaves the worker**. You keep the token-efficiency of Code Mode (~2,500 endpoints as the `search` / `execute` / `docs` tools) while controlling access and pinning a single account.
 
-| Approach                                    | Tools | Token cost | Context used (200K) |
-| ------------------------------------------- | ----- | ---------- | ------------------- |
-| Raw OpenAPI spec in prompt                  | —     | ~2,000,000 | 977%                |
-| Native MCP (full schemas)                   | 2,594 | 1,170,523  | 585%                |
-| Native MCP (minimal — required params only) | 2,594 | 244,047    | 122%                |
-| Code mode                                   | 3     | ~1,100     | 0.5%                |
+```
+MCP client (Claude)                 your worker                     upstream
+        │                                │                             │
+        │  OAuth (authorize/token) ─────►│  gate on WORKER_API_KEY     │
+        │  Bearer mcp_at_… ─── /mcp ────►│  swap in CF token ────────► mcp.cloudflare.com/mcp
+        │◄──────────── tools / results ──┤◄────────────────────────────┤
+```
 
-## Get Started
+## What it does
 
-MCP URL: `https://mcp.cloudflare.com/mcp`
+- **Fronts the Cloudflare API MCP server** with your own URL and auth.
+- **Keeps the privileged token server-side** — the client only ever holds a short opaque `mcp_at_…` token this worker issues.
+- **Injects `account_id`** into `execute` tool calls automatically, so a multi-account user token resolves the right account without the model supplying it.
+- **Serves a landing page + OAuth consent screen** (Astro + React/shadcn/ReUI).
 
-### Option 1: OAuth (Recommended)
+## Connect a client
 
-Just connect to the MCP server URL - you'll be redirected to Cloudflare to authorize and select permissions.
-
-#### Example JSON Configuration
+Point the MCP client at your deployed worker's `/mcp` endpoint:
 
 ```json
 {
   "mcpServers": {
     "cloudflare-api": {
       "type": "http",
-      "url": "https://mcp.cloudflare.com/mcp"
+      "url": "https://<your-worker-subdomain>.workers.dev/mcp"
     }
   }
 }
 ```
 
-### Option 2: API Token
+On first connect the client runs the OAuth flow and opens the worker's **/authorize** page, where you paste your **`WORKER_API_KEY`** (stored in Cloudflare Secrets Store) to approve access. The client then receives a 1‑year token and can list/call the `search`, `execute`, and `docs` tools. (If the connector shows *"no tools available"*, disconnect and reconnect so it re-runs the current PKCE flow.)
 
-For CI/CD, automation, or if you prefer managing tokens yourself.
+## Auth model
 
-Create a [Cloudflare API token](https://dash.cloudflare.com/profile/api-tokens) with the permissions you need. Both **user tokens** and **account tokens** are supported. For account tokens, include the **Account Resources : Read** permission so the server can auto-detect your account ID.
+| Route | Purpose |
+| ----- | ------- |
+| `/.well-known/*` | OAuth 2.1 / OpenID discovery metadata |
+| `/register` | Dynamic client registration |
+| `/authorize` | Consent page — enter `WORKER_API_KEY`; validates `redirect_uri` against the registered client and requires **S256 PKCE**; mints a single-use code |
+| `/token` | Exchanges a single-use code (**PKCE verifier required**) for an opaque access token; supports `refresh_token` rotation |
+| `/mcp` | Validates the bearer (an issued token in `OAUTH_KV`, or `WORKER_API_KEY` for direct API-key mode), then proxies upstream with the privileged token |
 
-> **Note:** API tokens with **Client IP Address Filtering** enabled are not currently supported.
+## Deploy
 
-### Add to Agent
+This is an Astro SSR Worker. Deploy with:
 
-| Setting      | Value                                                                       |
-| ------------ | --------------------------------------------------------------------------- |
-| MCP URL      | `https://mcp.cloudflare.com/mcp`                                            |
-| Bearer Token | Your [Cloudflare API Token](https://dash.cloudflare.com/profile/api-tokens) |
-
-### Disable Code Mode
-
-If your MCP client already uses code mode, or you're composing this server with another server that uses code mode, you can disable it with the `?codemode=false` query parameter. This registers an individual tool for each of the ~2,500 Cloudflare API endpoints instead of the code mode API tools. The `docs` tool remains available in both modes.
-
-```
-https://mcp.cloudflare.com/mcp?codemode=false
+```bash
+pnpm install
+pnpm run deploy    # astro build && wrangler deploy … dist/server/entry.mjs --assets dist/client
 ```
 
-#### Example JSON Configuration
+For Cloudflare Workers Builds (dash CI/CD), set the **Deploy command** to `pnpm run deploy`. See **[DEPLOY.md](./DEPLOY.md)** for the full rationale (entry + assets must be passed on the CLI, not in `wrangler.jsonc`) and the exact dashboard settings.
 
-```json
-{
-  "mcpServers": {
-    "cloudflare-api": {
-      "type": "http",
-      "url": "https://mcp.cloudflare.com/mcp?codemode=false"
-    }
-  }
-}
+## Configuration
+
+`wrangler.jsonc` declares the bindings the worker needs:
+
+- **KV:** `SESSION` (Astro sessions), `OAUTH_KV` (issued tokens, auth codes, client registrations)
+- **Secrets Store:** `WORKER_API_KEY` (the access gate), `CLOUDFLARE_WRANGLER_API_TOKEN` (privileged token forwarded upstream), `CLOUDFLARE_ACCOUNT_ID` (injected into `execute`), `REUI_LICENSE_KEY`
+- **Var:** `UPSTREAM_MCP_URL` (defaults to `https://mcp.cloudflare.com/mcp`)
+- `preview_urls` is `false` — see DEPLOY.md.
+
+The upstream token can be either a **user token** or an **account token**; for account tokens include **Account Resources : Read** so the account ID auto-detects. API tokens with **Client IP Address Filtering** enabled are not supported.
+
+## Development
+
+```bash
+pnpm run dev          # astro dev
+pnpm run check        # format:check + lint + typecheck
+pnpm run test         # vitest (Workers pool)
 ```
 
-When code mode is disabled:
-- Each API endpoint is registered as its own tool (e.g., `get_workers_scripts`, `post_d1_database`)
-- Tool input schemas are derived from the endpoint's path parameters, query parameters, and request body
-- Tools make direct API calls — no code execution involved
-- Path parameters like `account_id` are auto-resolved when possible (single account)
+See **[AGENTS.md](./AGENTS.md)** for architecture, conventions, and contribution guidance.
 
-> **Note:** Disabling code mode significantly increases the token cost (~244k tokens vs ~1k tokens). Only disable it when necessary for composition with other code mode systems.
+## About Code Mode (upstream)
 
-## The Problem
+The tools this proxy exposes come from Cloudflare's Code Mode server: the agent writes JavaScript to `search` the OpenAPI spec and `execute` `cloudflare.request()` calls, fitting ~2,500 endpoints into ~1k tokens. Learn more:
 
-The Cloudflare OpenAPI spec is **2 million tokens**. Even with native MCP tools using minimal schemas, it's still **~244k tokens**. Traditional MCP servers that expose every endpoint as a tool leak this entire context to the main agent.
-
-This server solves the problem by using **code execution** in a [Code Mode](https://blog.cloudflare.com/code-mode-mcp/) pattern - the spec lives on the server, and only the result of the code execution is returned to the agent.
-
-## Tools
-
-Agent writes code to search the spec and execute API calls. It can also search Cloudflare's developer documentation directly.
-
-| Tool      | Description                                                                   |
-| --------- | ----------------------------------------------------------------------------- |
-| `docs`    | Search Cloudflare developer documentation                                     |
-| `search`  | Write JavaScript to query `spec.paths` and find endpoints                     |
-| `execute` | Write JavaScript to call `cloudflare.request()` with the discovered endpoints |
-
-```
-Agent                         MCP Server
-  │                               │
-  ├──search({code: "..."})───────►│ Execute code against spec.json
-  │◄──[matching endpoints]────────│
-  │                               │
-  ├──execute({code: "..."})──────►│ Execute code against Cloudflare API
-  │◄──[API response]──────────────│
-```
-
-## Supported Products
-
-Workers, KV, R2, D1, Pages, DNS, Firewall, Load Balancers, Stream, Images, AI Gateway, Vectorize, Access, Gateway, and more. See the full [Cloudflare API schemas](https://github.com/cloudflare/api-schemas).
-
-## Usage
-
-Once configured, just ask your agent to do things with Cloudflare:
-
-- "List all my Workers"
-- "Create a KV namespace called 'my-cache'"
-- "Add an A record for api.example.com pointing to 192.0.2.1"
-
-The agent will search for the right endpoints and execute the API calls. Here's what happens behind the scenes:
-
-```javascript
-// 1. Search for endpoints
-search({
-  code: `async () => {
-    const results = [];
-    for (const [path, methods] of Object.entries(spec.paths)) {
-      for (const [method, op] of Object.entries(methods)) {
-        if (op.tags?.some(t => t.toLowerCase() === 'workers')) {
-          results.push({ method: method.toUpperCase(), path, summary: op.summary });
-        }
-      }
-    }
-    return results;
-  }`,
-});
-
-// 2. Execute API call (user token - account_id required)
-execute({
-  code: `async () => {
-    const response = await cloudflare.request({
-      method: "GET",
-      path: \`/accounts/\${accountId}/workers/scripts\`
-    });
-    return response.result;
-  }`,
-  account_id: "your-account-id",
-});
-
-// 2. Execute API call (account token - account_id auto-detected)
-execute({
-  code: `async () => {
-    const response = await cloudflare.request({
-      method: "GET",
-      path: \`/accounts/\${accountId}/workers/scripts\`
-    });
-    return response.result;
-  }`,
-});
-```
-
-### GraphQL Analytics API
-
-The server automatically detects and handles Cloudflare's GraphQL Analytics API endpoints. GraphQL queries work seamlessly through the same `execute` tool:
-
-```javascript
-execute({
-  code: `async () => {
-    const response = await cloudflare.request({
-      method: "POST",
-      path: "/client/v4/graphql",
-      body: {
-        query: \`query {
-          viewer {
-            zones(filter: { zoneTag: "your-zone-id" }) {
-              httpRequests1dGroups(limit: 7, orderBy: [date_ASC]) {
-                dimensions {
-                  date
-                }
-                sum {
-                  requests
-                  bytes
-                  cachedBytes
-                }
-              }
-            }
-          }
-        }\`,
-        variables: {}
-      }
-    });
-    return response.result;
-  }`,
-  account_id: "your-account-id",
-});
-```
-
-## Build a Code Mode MCP Server
-
-Code execution uses Cloudflare's [Dynamic Worker Loader API](https://developers.cloudflare.com/workers/runtime-apis/bindings/worker-loader/) to run generated code in isolated Workers, following the [Code Mode pattern](https://github.com/cloudflare/agents/tree/main/packages/codemode).
-
-Read the [Code Mode SDK docs](https://developers.cloudflare.com/agents/api-reference/codemode/) for more info.
-
-### Resources
-
-- [Code Mode blog post](https://blog.cloudflare.com/code-mode/)
-- [Build your own remote MCP server](https://developers.cloudflare.com/agents/guides/remote-mcp-server/)
-- [Cloudflare's own MCP Servers](https://github.com/cloudflare/mcp-server-cloudflare)
+- [Code Mode blog post](https://blog.cloudflare.com/code-mode-mcp/)
+- [Cloudflare's own MCP servers](https://github.com/cloudflare/mcp-server-cloudflare)
+- [Build a remote MCP server](https://developers.cloudflare.com/agents/guides/remote-mcp-server/)
