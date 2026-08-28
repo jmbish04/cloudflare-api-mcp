@@ -51,6 +51,50 @@ export function injectAccountId(bodyText: string, accountId: string): string {
   return JSON.stringify(parsed)
 }
 
+/**
+ * Decide whether a presented bearer may proxy to the privileged upstream.
+ *
+ * Two credential paths are accepted, mirroring the two ways this server issues
+ * access:
+ *
+ * 1. **Direct API-key mode** — the bearer equals the shared `WORKER_API_KEY`
+ *    secret. This is the path the "review finding #2" guard protected: without a
+ *    check here, any bearer would proxy using our Cloudflare API token.
+ * 2. **OAuth mode** — the bearer is an `mcp_at_...` token this server minted at
+ *    `/token` and persisted in `OAUTH_KV` under `token:<token>`. This is the path
+ *    every real MCP client (Claude) uses. The previous gate only accepted case 1,
+ *    so OAuth-issued tokens were rejected with 401 and clients saw "no tools
+ *    available" — the connector authenticated but could never list or call tools.
+ *
+ * A token is honored unless it was explicitly deactivated (`active: false`).
+ *
+ * @param presentedToken bearer stripped of the `Bearer ` prefix
+ * @param workerApiKey resolved `WORKER_API_KEY` secret, or null when unavailable
+ * @param kv `OAUTH_KV` namespace holding issued tokens, or undefined in tests
+ * @returns whether the request may proceed to the upstream proxy
+ */
+export async function isAuthorizedBearer(
+  presentedToken: string,
+  workerApiKey: string | null,
+  kv: KVNamespace | undefined
+): Promise<boolean> {
+  if (!presentedToken) return false
+
+  // Direct API-key mode: the shared worker secret is accepted verbatim.
+  if (workerApiKey && presentedToken === workerApiKey) return true
+
+  // OAuth mode: accept only tokens this server issued and still considers active.
+  if (!kv) return false
+  try {
+    const stored = await kv.get(`token:${presentedToken}`)
+    if (!stored) return false
+    const parsed = JSON.parse(stored) as { active?: boolean }
+    return parsed.active !== false
+  } catch {
+    return false
+  }
+}
+
 export const ALL: APIRoute = async ({ request, url }) => {
   const origin = request.headers.get('Origin') ?? '*'
 
@@ -92,12 +136,15 @@ export const ALL: APIRoute = async ({ request, url }) => {
     return unauthorized()
   }
 
-  // Validate the presented bearer against WORKER_API_KEY before handing the
-  // privileged upstream token to the request. Without this, any bearer would
-  // proxy with our Cloudflare API token. Review finding #2.
-  const workerApiKey = await env.WORKER_API_KEY.get()
+  // Validate the presented bearer before handing the privileged upstream token
+  // to the request. Without this, any bearer would proxy with our Cloudflare API
+  // token (review finding #2). Accept both the shared WORKER_API_KEY (direct
+  // mode) and OAuth tokens this server issued at /token (the path Claude uses) —
+  // gating on WORKER_API_KEY alone rejected every OAuth token with 401, which
+  // surfaced to clients as "no tools available".
+  const workerApiKey = await env.WORKER_API_KEY.get().catch(() => null)
   const presentedToken = authHeader.slice('Bearer '.length).trim()
-  if (!workerApiKey || presentedToken !== workerApiKey) {
+  if (!(await isAuthorizedBearer(presentedToken, workerApiKey, env.OAUTH_KV))) {
     return unauthorized()
   }
 
