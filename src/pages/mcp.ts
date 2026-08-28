@@ -1,5 +1,6 @@
 import type { APIRoute } from 'astro'
 import { env } from 'cloudflare:workers'
+import { timingSafeEqual } from '../lib/oauth'
 
 export const prerender = false
 
@@ -80,16 +81,17 @@ export async function isAuthorizedBearer(
 ): Promise<boolean> {
   if (!presentedToken) return false
 
-  // Direct API-key mode: the shared worker secret is accepted verbatim.
-  if (workerApiKey && presentedToken === workerApiKey) return true
+  // Direct API-key mode: the shared worker secret is accepted, compared in
+  // constant time to avoid leaking it through response timing.
+  if (workerApiKey && timingSafeEqual(presentedToken, workerApiKey)) return true
 
-  // OAuth mode: accept only tokens this server issued and still considers active.
+  // OAuth mode: accept only tokens this server issued and still marks active.
   if (!kv) return false
   try {
     const stored = await kv.get(`token:${presentedToken}`)
     if (!stored) return false
-    const parsed = JSON.parse(stored) as { active?: boolean }
-    return parsed.active !== false
+    const parsed = JSON.parse(stored) as { active?: boolean } | null
+    return parsed?.active === true
   } catch {
     return false
   }

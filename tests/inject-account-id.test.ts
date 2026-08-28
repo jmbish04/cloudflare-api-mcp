@@ -3,7 +3,12 @@ import { injectAccountId } from '../src/pages/mcp'
 
 const ACCT = 'b3304b14848de15c72c24a14b0cd187d'
 const call = (args: Record<string, unknown>) =>
-  JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'execute', arguments: args } })
+  JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'execute', arguments: args }
+  })
 
 describe('injectAccountId', () => {
   it('adds account_id to an execute call that lacks it', () => {
