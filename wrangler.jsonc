@@ -2,9 +2,11 @@
   "name": "cloudflare-api-mcp",
   "compatibility_date": "2026-01-12",
   "compatibility_flags": ["nodejs_compat"],
-  // Pin Preview URLs on so a Wrangler deploy never reverts the dashboard setting.
-  // Workers Builds needs this for non-production (PR) preview deployments.
-  "preview_urls": true,
+  // Preview URLs are disabled: Workers Builds preview (non-production) deployments
+  // are not reliably compatible with this Worker's runtime/bindings, so their
+  // preview URL renders incorrectly. Pinning false also stops a wrangler deploy
+  // from re-enabling previews. Production deploys on the main branch are unaffected.
+  "preview_urls": false,
   "observability": {
     "logs": {
       "enabled": true
