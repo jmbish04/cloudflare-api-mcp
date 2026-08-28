@@ -24,6 +24,8 @@ if (Astro.request.method === 'POST') {
         state?: string
         responseType?: string
         scope?: string[]
+        codeChallenge?: string
+        codeChallengeMethod?: string
       }
       try {
         oauthReqInfo = JSON.parse(statePayload)
@@ -50,13 +52,16 @@ if (Astro.request.method === 'POST') {
           const redirectUrl = new URL(targetRedirectUri)
           const authCode = `auth_${crypto.randomUUID().replace(/-/g, '')}`
 
-          // Store auth code in KV for /token exchange
+          // Store auth code in KV for /token exchange. The PKCE challenge is
+          // carried through so /token can verify the client's code_verifier.
           if (env.OAUTH_KV) {
             await env.OAUTH_KV.put(
               `code:${authCode}`,
               JSON.stringify({
                 clientId: oauthReqInfo.clientId,
                 redirectUri: targetRedirectUri,
+                codeChallenge: oauthReqInfo.codeChallenge,
+                codeChallengeMethod: oauthReqInfo.codeChallengeMethod,
                 issuedAt: Date.now()
               }),
               { expirationTtl: 600 }
@@ -84,6 +89,9 @@ if (Astro.request.method === 'POST') {
     const state = params.get('state') || ''
     const responseType = params.get('response_type') || 'code'
     const scope = (params.get('scope') || 'read write').split(' ').filter(Boolean)
+    const codeChallenge = params.get('code_challenge') || ''
+    const codeChallengeMethod =
+      params.get('code_challenge_method') || (codeChallenge ? 'S256' : '')
 
     if (env.OAUTH_KV && clientId) {
       const clientJson = await env.OAUTH_KV.get(`client:${clientId}`)
@@ -102,7 +110,9 @@ if (Astro.request.method === 'POST') {
       redirectUri,
       state,
       responseType,
-      scope
+      scope,
+      codeChallenge,
+      codeChallengeMethod
     }
     statePayload = JSON.stringify(oauthReqInfo)
   } catch (err) {
