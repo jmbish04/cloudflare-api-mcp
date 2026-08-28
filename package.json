@@ -41,5 +41,8 @@
     "typescript": "^5.7.0",
     "vitest": "^4.1.8",
     "wrangler": "^4.103.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "sharp", "workerd"]
   }
 }
