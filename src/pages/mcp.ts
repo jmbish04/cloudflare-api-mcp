@@ -7,8 +7,7 @@ import {
   detectSearchCall,
   extractToolText,
   mergeDocsIntoSearch,
-  parseRpc,
-  pickDocsToolName
+  parseRpc
 } from '../lib/docs-pairing'
 
 export const prerender = false
@@ -24,6 +23,9 @@ const DOCS_PAIRING_ENABLED = true
 // by querying this server's documentation tool. It is NOT sent the privileged
 // Cloudflare API token — it is a different, unauthenticated service.
 const DOCS_MCP_URL = 'https://docs.mcp.cloudflare.com/mcp'
+
+// The documentation search tool that server exposes.
+const DOCS_TOOL_NAME = 'search_cloudflare_documentation'
 
 /**
  * Inject the configured account id into upstream `execute` tool calls.
@@ -135,41 +137,14 @@ function buildDocsHeaders(protocolVersion: string | null): Headers {
   return headers
 }
 
-// Per-isolate cache of the docs server's tool name. `undefined` = not yet
-// discovered; a string = the tool name; a failed discovery is not cached (the
-// promise is cleared) so a later request retries.
-let docsToolDiscovery: Promise<string | null> | null = null
-
-async function discoverDocsToolName(target: string, docsHeaders: Headers): Promise<string | null> {
-  try {
-    const resp = await fetch(target, {
-      method: 'POST',
-      headers: docsHeaders,
-      body: JSON.stringify({ jsonrpc: '2.0', id: 'docs-discovery', method: 'tools/list' })
-    })
-    if (!resp.ok) return null
-    return pickDocsToolName(parseRpc(await resp.text()))
-  } catch {
-    return null
-  }
-}
-
-async function resolveDocsToolName(target: string, docsHeaders: Headers): Promise<string | null> {
-  if (!docsToolDiscovery) docsToolDiscovery = discoverDocsToolName(target, docsHeaders)
-  const name = await docsToolDiscovery
-  if (name === null) docsToolDiscovery = null // allow a later retry after a miss
-  return name
-}
-
 /**
  * Proxy a `search` tool call and, when possible, enrich its result with docs.
  *
  * The search request runs against the API upstream; the docs request runs in
  * parallel against Cloudflare's separate documentation MCP (`docsTarget`), which
  * is public and receives no privileged token. On any uncertainty — no derivable
- * query, no docs tool, a non-JSON (e.g. streamed) search response, or a
- * failed/empty docs call — the untouched search response is returned, so `search`
- * behaviour never regresses.
+ * query, a non-JSON (e.g. streamed) search response, or a failed/empty docs call —
+ * the untouched search response is returned, so `search` behaviour never regresses.
  */
 async function proxySearchWithDocs(
   apiTarget: string,
@@ -177,6 +152,7 @@ async function proxySearchWithDocs(
   searchBody: string,
   docsTarget: string,
   docsHeaders: Headers,
+  docsToolName: string,
   args: Record<string, unknown>,
   origin: string
 ): Promise<Response> {
@@ -188,19 +164,14 @@ async function proxySearchWithDocs(
     redirect: 'follow'
   })
 
-  let docsToolName: string | null = null
-  let docsPromise: Promise<Response | null> = Promise.resolve(null)
-  if (query) {
-    docsToolName = await resolveDocsToolName(docsTarget, docsHeaders)
-    if (docsToolName) {
-      docsPromise = fetch(docsTarget, {
+  const docsPromise: Promise<Response | null> = query
+    ? fetch(docsTarget, {
         method: 'POST',
-        headers: new Headers(docsHeaders),
+        headers: docsHeaders,
         body: buildDocsRequestBody(docsToolName, query),
         redirect: 'follow'
       }).catch(() => null)
-    }
-  }
+    : Promise.resolve(null)
 
   const searchResp = await searchPromise
   const contentType = searchResp.headers.get('Content-Type') ?? ''
@@ -212,7 +183,7 @@ async function proxySearchWithDocs(
     })
 
   // Only merge into a plain-JSON search response; stream anything else through.
-  if (!query || !docsToolName || !contentType.includes('application/json')) {
+  if (!query || !contentType.includes('application/json')) {
     return passthrough()
   }
 
@@ -332,6 +303,7 @@ export const ALL: APIRoute = async ({ request, url }) => {
         typeof forwardedBody === 'string' ? forwardedBody : '',
         DOCS_MCP_URL,
         buildDocsHeaders(request.headers.get('MCP-Protocol-Version')),
+        DOCS_TOOL_NAME,
         searchCall.args,
         origin
       )

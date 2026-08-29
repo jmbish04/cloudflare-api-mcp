@@ -5,8 +5,7 @@ import {
   detectSearchCall,
   extractToolText,
   mergeDocsIntoSearch,
-  parseRpc,
-  pickDocsToolName
+  parseRpc
 } from '../src/lib/docs-pairing'
 
 describe('parseRpc', () => {
@@ -82,37 +81,15 @@ describe('deriveDocsQuery', () => {
 
 describe('buildDocsRequestBody', () => {
   it('builds a docs tools/call body', () => {
-    const body = JSON.parse(buildDocsRequestBody('docs', 'workers kv', 42))
+    const body = JSON.parse(
+      buildDocsRequestBody('search_cloudflare_documentation', 'workers kv', 42)
+    )
     expect(body).toEqual({
       jsonrpc: '2.0',
       id: 42,
       method: 'tools/call',
-      params: { name: 'docs', arguments: { query: 'workers kv' } }
+      params: { name: 'search_cloudflare_documentation', arguments: { query: 'workers kv' } }
     })
-  })
-})
-
-describe('pickDocsToolName', () => {
-  const list = (tools: unknown[]) => ({ jsonrpc: '2.0', id: 1, result: { tools } })
-
-  it('prefers an exact "docs" tool', () => {
-    expect(pickDocsToolName(list([{ name: 'search' }, { name: 'docs' }]))).toBe('docs')
-  })
-
-  it('falls back to a name containing "doc"', () => {
-    expect(pickDocsToolName(list([{ name: 'search' }, { name: 'docs_search' }]))).toBe(
-      'docs_search'
-    )
-  })
-
-  it('falls back to a description match', () => {
-    expect(
-      pickDocsToolName(list([{ name: 'lookup', description: 'Search developer documentation' }]))
-    ).toBe('lookup')
-  })
-
-  it('returns null when no docs-like tool exists', () => {
-    expect(pickDocsToolName(list([{ name: 'search' }, { name: 'execute' }]))).toBeNull()
   })
 })
 

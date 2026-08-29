@@ -170,32 +170,6 @@ export function buildDocsRequestBody(
   })
 }
 
-/**
- * From a `tools/list` result, pick the documentation tool's name: an exact
- * `docs`, else any tool whose name contains "doc", else one whose description
- * mentions documentation. Returns null when none is found.
- */
-export function pickDocsToolName(parsed: unknown): string | null {
-  const m = asRecord(parsed)
-  const result = m ? asRecord(m.result) : null
-  if (!result || !Array.isArray(result.tools)) return null
-
-  const named = (result.tools as unknown[])
-    .map((t) => asRecord(t))
-    .filter((t): t is Record<string, unknown> => !!t && typeof t.name === 'string')
-
-  const exact = named.find((t) => t.name === 'docs')
-  if (exact) return exact.name as string
-  const containsDoc = named.find((t) => /doc/i.test(t.name as string))
-  if (containsDoc) return containsDoc.name as string
-  const byDesc = named.find(
-    (t) =>
-      typeof t.description === 'string' &&
-      /documentation|developer docs/i.test(t.description as string)
-  )
-  return byDesc ? (byDesc.name as string) : null
-}
-
 /** Concatenate the text content of a tool-call result, or null on error/no text. */
 export function extractToolText(parsed: unknown): string | null {
   const m = asRecord(parsed)
