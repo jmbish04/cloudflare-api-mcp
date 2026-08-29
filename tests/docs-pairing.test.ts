@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildDocsHeaders,
   buildDocsRequestBody,
   deriveDocsQuery,
   detectSearchCall,
@@ -7,6 +8,22 @@ import {
   mergeDocsIntoSearch,
   parseRpc
 } from '../src/lib/docs-pairing'
+
+describe('buildDocsHeaders', () => {
+  it('never carries an Authorization header (no privileged-token leak to the docs server)', () => {
+    const h = buildDocsHeaders('2026-07-28')
+    expect(h.get('Authorization')).toBeNull()
+    expect(h.get('Content-Type')).toBe('application/json')
+    expect(h.get('Accept')).toContain('application/json')
+    expect(h.get('MCP-Protocol-Version')).toBe('2026-07-28')
+  })
+
+  it('omits the protocol version header when none is provided', () => {
+    const h = buildDocsHeaders(null)
+    expect(h.get('MCP-Protocol-Version')).toBeNull()
+    expect(h.get('Authorization')).toBeNull()
+  })
+})
 
 describe('parseRpc', () => {
   it('parses plain JSON', () => {

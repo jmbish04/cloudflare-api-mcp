@@ -2,6 +2,7 @@ import type { APIRoute } from 'astro'
 import { env } from 'cloudflare:workers'
 import { timingSafeEqual } from '../lib/oauth'
 import {
+  buildDocsHeaders,
   buildDocsRequestBody,
   deriveDocsQuery,
   detectSearchCall,
@@ -128,13 +129,31 @@ function withCorsHeaders(upstream: Headers, origin: string): Headers {
   return headers
 }
 
-/** Clean headers for the public docs MCP server — no privileged Authorization. */
-function buildDocsHeaders(protocolVersion: string | null): Headers {
-  const headers = new Headers()
-  headers.set('Content-Type', 'application/json')
-  headers.set('Accept', 'application/json, text/event-stream')
-  if (protocolVersion) headers.set('MCP-Protocol-Version', protocolVersion)
-  return headers
+// The docs enrichment is best-effort: a slow docs server must never hold the
+// (already-ready) search response hostage, so the docs fetch is time-boxed and a
+// timeout is treated exactly like a failure — search is returned unenriched.
+const DOCS_FETCH_TIMEOUT_MS = 2500
+
+async function fetchDocsWithTimeout(
+  target: string,
+  headers: Headers,
+  body: string
+): Promise<Response | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), DOCS_FETCH_TIMEOUT_MS)
+  try {
+    return await fetch(target, {
+      method: 'POST',
+      headers,
+      body,
+      redirect: 'follow',
+      signal: controller.signal
+    })
+  } catch {
+    return null // network error or timeout/abort → no docs, search is unaffected
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /**
@@ -165,12 +184,7 @@ async function proxySearchWithDocs(
   })
 
   const docsPromise: Promise<Response | null> = query
-    ? fetch(docsTarget, {
-        method: 'POST',
-        headers: docsHeaders,
-        body: buildDocsRequestBody(docsToolName, query),
-        redirect: 'follow'
-      }).catch(() => null)
+    ? fetchDocsWithTimeout(docsTarget, docsHeaders, buildDocsRequestBody(docsToolName, query))
     : Promise.resolve(null)
 
   const searchResp = await searchPromise
@@ -198,7 +212,12 @@ async function proxySearchWithDocs(
 
   const outHeaders = withCorsHeaders(searchResp.headers, origin)
   outHeaders.set('Content-Type', 'application/json')
-  outHeaders.delete('Content-Length') // body length changed
+  // The body here is decoded plaintext we re-serialized, so drop any framing/
+  // encoding headers copied from the upstream response — otherwise a client could
+  // try to gunzip an identity body and fail to decode a result we promised to keep.
+  outHeaders.delete('Content-Length')
+  outHeaders.delete('Content-Encoding')
+  outHeaders.delete('Transfer-Encoding')
   return new Response(outText, {
     status: searchResp.status,
     statusText: searchResp.statusText,

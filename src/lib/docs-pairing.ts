@@ -156,6 +156,19 @@ export function deriveDocsQuery(args: Record<string, unknown>): string | null {
   return terms.length ? terms.join(' ') : null
 }
 
+/**
+ * Clean headers for the public docs MCP server. Constructed from scratch so it
+ * can NEVER carry the privileged `Authorization` the API upstream receives — the
+ * docs server is a different, unauthenticated service and must not see the token.
+ */
+export function buildDocsHeaders(protocolVersion: string | null): Headers {
+  const headers = new Headers()
+  headers.set('Content-Type', 'application/json')
+  headers.set('Accept', 'application/json, text/event-stream')
+  if (protocolVersion) headers.set('MCP-Protocol-Version', protocolVersion)
+  return headers
+}
+
 /** Build the JSON-RPC body for a docs tool call. */
 export function buildDocsRequestBody(
   docsToolName: string,
