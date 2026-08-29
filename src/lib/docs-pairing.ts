@@ -1,11 +1,11 @@
 /**
  * Automatic docs pairing for the `/mcp` proxy.
  *
- * When a client calls the upstream `search` tool (which returns Cloudflare API
- * endpoints — the methods and payloads to use), the proxy also calls the upstream
- * documentation tool with a query derived from the search, and appends that
- * documentation context to the search result. The agent then gets both "which
- * endpoint" and "how the product works" from one search.
+ * When a client calls the API `search` tool (which returns Cloudflare API
+ * endpoints — the methods and payloads to use), the proxy also queries Cloudflare's
+ * separate documentation MCP server with a query derived from the search, and
+ * appends that documentation context to the search result. The agent then gets
+ * both "which endpoint" and "how the product works" from one search.
  *
  * Everything here is pure (no Worker bindings, no fetch) so the transforms are
  * unit-testable. `mcp.ts` performs the I/O and falls back to the untouched search

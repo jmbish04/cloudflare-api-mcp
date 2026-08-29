@@ -106,10 +106,11 @@ A `package-lock.json` is also committed (GitHub Actions uses `npm ci`); keep bot
 `injectAccountId` (in `mcp.ts`) splices the configured `CLOUDFLARE_ACCOUNT_ID` into `tools/call` bodies for the `execute` tool when the arg is absent, so multi-account user tokens resolve the right account. Other tools are untouched; an existing `account_id` is never overwritten. Failures fall back to no injection (best-effort, never 500s the proxy).
 
 ### Docs pairing (search → docs)
-When a client calls the `search` tool, the proxy also calls the upstream **docs** tool and appends the documentation to the search result, so the agent gets endpoint methods/payloads *and* product context from one call. Pure transforms live in `lib/docs-pairing.ts` (`detectSearchCall`, `deriveDocsQuery`, `pickDocsToolName`, `extractToolText`, `mergeDocsIntoSearch`); `mcp.ts` does the I/O:
+When a client calls the `search` tool, the proxy also queries **Cloudflare's separate documentation MCP server** (`DOCS_MCP_URL` = `https://docs.mcp.cloudflare.com/mcp`) and appends the documentation to the search result, so the agent gets endpoint methods/payloads *and* product context from one call. Pure transforms live in `lib/docs-pairing.ts` (`detectSearchCall`, `deriveDocsQuery`, `pickDocsToolName`, `extractToolText`, `mergeDocsIntoSearch`); `mcp.ts` does the I/O:
 
+- **Two servers:** `search` is forwarded to the API upstream (`UPSTREAM_MCP_URL`) as usual; the docs call goes to the public docs MCP and **carries no privileged token** (a different, unauthenticated service).
 - The docs query is derived from the search `code`'s string literals (product/tag/path terms, stopwords removed), or taken from an explicit `docs_query` argument.
-- The docs tool name is discovered from the upstream `tools/list` (cached per isolate; falls back gracefully), since the upstream may name it `docs` or similar.
+- The docs tool name is discovered from the docs server's `tools/list` (cached per isolate; falls back gracefully), since its tool may be named `docs`, `search`, `search_cloudflare_documentation`, etc.
 - Search and docs fetch in parallel. **It fails safe:** on no derivable query, no docs tool, a non-JSON (streamed) search response, or a failed/empty docs call, the untouched search response is returned — pairing can never degrade `search`. Toggle with `DOCS_PAIRING_ENABLED` in `mcp.ts`.
 
 ### Bindings (`wrangler.jsonc`)

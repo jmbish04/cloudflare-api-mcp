@@ -15,9 +15,15 @@ export const prerender = false
 
 const DEFAULT_UPSTREAM = 'https://mcp.cloudflare.com/mcp'
 
-// Automatically enrich `search` tool results with upstream documentation. Flip to
-// false to disable pairing without touching the proxy logic.
+// Automatically enrich `search` tool results with Cloudflare documentation. Flip
+// to false to disable pairing without touching the proxy logic.
 const DOCS_PAIRING_ENABLED = true
+
+// Cloudflare's documentation MCP is a SEPARATE, public server from the API MCP
+// (`UPSTREAM_MCP_URL`) that this proxy forwards to. `search` results are enriched
+// by querying this server's documentation tool. It is NOT sent the privileged
+// Cloudflare API token — it is a different, unauthenticated service.
+const DOCS_MCP_URL = 'https://docs.mcp.cloudflare.com/mcp'
 
 /**
  * Inject the configured account id into upstream `execute` tool calls.
@@ -120,20 +126,25 @@ function withCorsHeaders(upstream: Headers, origin: string): Headers {
   return headers
 }
 
-// Per-isolate cache of the resolved upstream docs tool name. `undefined` = not
-// yet discovered; a string = the tool name; a failed discovery is not cached
-// (the promise is cleared) so a later request retries.
+/** Clean headers for the public docs MCP server — no privileged Authorization. */
+function buildDocsHeaders(protocolVersion: string | null): Headers {
+  const headers = new Headers()
+  headers.set('Content-Type', 'application/json')
+  headers.set('Accept', 'application/json, text/event-stream')
+  if (protocolVersion) headers.set('MCP-Protocol-Version', protocolVersion)
+  return headers
+}
+
+// Per-isolate cache of the docs server's tool name. `undefined` = not yet
+// discovered; a string = the tool name; a failed discovery is not cached (the
+// promise is cleared) so a later request retries.
 let docsToolDiscovery: Promise<string | null> | null = null
 
-async function discoverDocsToolName(target: string, baseHeaders: Headers): Promise<string | null> {
+async function discoverDocsToolName(target: string, docsHeaders: Headers): Promise<string | null> {
   try {
-    const headers = new Headers(baseHeaders)
-    headers.set('Content-Type', 'application/json')
-    headers.set('Accept', 'application/json, text/event-stream')
-    headers.delete('Content-Length')
     const resp = await fetch(target, {
       method: 'POST',
-      headers,
+      headers: docsHeaders,
       body: JSON.stringify({ jsonrpc: '2.0', id: 'docs-discovery', method: 'tools/list' })
     })
     if (!resp.ok) return null
@@ -143,42 +154,48 @@ async function discoverDocsToolName(target: string, baseHeaders: Headers): Promi
   }
 }
 
-async function resolveDocsToolName(target: string, baseHeaders: Headers): Promise<string | null> {
-  if (!docsToolDiscovery) docsToolDiscovery = discoverDocsToolName(target, baseHeaders)
+async function resolveDocsToolName(target: string, docsHeaders: Headers): Promise<string | null> {
+  if (!docsToolDiscovery) docsToolDiscovery = discoverDocsToolName(target, docsHeaders)
   const name = await docsToolDiscovery
   if (name === null) docsToolDiscovery = null // allow a later retry after a miss
   return name
 }
 
 /**
- * Proxy a `search` tool call and, when possible, enrich its result with upstream
- * documentation. The search request always runs; the docs request runs in
- * parallel. On any uncertainty — no derivable query, no docs tool, a non-JSON
- * (e.g. streamed) search response, or a failed/empty docs call — the untouched
- * search response is returned, so `search` behaviour never regresses.
+ * Proxy a `search` tool call and, when possible, enrich its result with docs.
+ *
+ * The search request runs against the API upstream; the docs request runs in
+ * parallel against Cloudflare's separate documentation MCP (`docsTarget`), which
+ * is public and receives no privileged token. On any uncertainty — no derivable
+ * query, no docs tool, a non-JSON (e.g. streamed) search response, or a
+ * failed/empty docs call — the untouched search response is returned, so `search`
+ * behaviour never regresses.
  */
 async function proxySearchWithDocs(
-  target: string,
-  headers: Headers,
-  body: string,
+  apiTarget: string,
+  apiHeaders: Headers,
+  searchBody: string,
+  docsTarget: string,
+  docsHeaders: Headers,
   args: Record<string, unknown>,
   origin: string
 ): Promise<Response> {
   const query = deriveDocsQuery(args)
-  const searchPromise = fetch(target, { method: 'POST', headers, body, redirect: 'follow' })
+  const searchPromise = fetch(apiTarget, {
+    method: 'POST',
+    headers: apiHeaders,
+    body: searchBody,
+    redirect: 'follow'
+  })
 
   let docsToolName: string | null = null
   let docsPromise: Promise<Response | null> = Promise.resolve(null)
   if (query) {
-    docsToolName = await resolveDocsToolName(target, headers)
+    docsToolName = await resolveDocsToolName(docsTarget, docsHeaders)
     if (docsToolName) {
-      const docsHeaders = new Headers(headers)
-      docsHeaders.set('Content-Type', 'application/json')
-      docsHeaders.set('Accept', 'application/json, text/event-stream')
-      docsHeaders.delete('Content-Length')
-      docsPromise = fetch(target, {
+      docsPromise = fetch(docsTarget, {
         method: 'POST',
-        headers: docsHeaders,
+        headers: new Headers(docsHeaders),
         body: buildDocsRequestBody(docsToolName, query),
         redirect: 'follow'
       }).catch(() => null)
@@ -305,13 +322,16 @@ export const ALL: APIRoute = async ({ request, url }) => {
   }
 
   try {
-    // `search` calls are enriched with upstream docs; everything else is a plain
-    // proxy. Pairing owns the search fetch, so it isn't also run below.
+    // `search` calls are enriched with Cloudflare docs; everything else is a plain
+    // proxy. Pairing owns the search fetch, so it isn't also run below. Docs go to
+    // the separate, public docs MCP server (never the privileged API token).
     if (searchCall) {
       return await proxySearchWithDocs(
         targetUrl.toString(),
         forwardedHeaders,
         typeof forwardedBody === 'string' ? forwardedBody : '',
+        DOCS_MCP_URL,
+        buildDocsHeaders(request.headers.get('MCP-Protocol-Version')),
         searchCall.args,
         origin
       )
