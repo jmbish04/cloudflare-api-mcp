@@ -1,10 +1,23 @@
 import type { APIRoute } from 'astro'
 import { env } from 'cloudflare:workers'
 import { timingSafeEqual } from '../lib/oauth'
+import {
+  buildDocsRequestBody,
+  deriveDocsQuery,
+  detectSearchCall,
+  extractToolText,
+  mergeDocsIntoSearch,
+  parseRpc,
+  pickDocsToolName
+} from '../lib/docs-pairing'
 
 export const prerender = false
 
 const DEFAULT_UPSTREAM = 'https://mcp.cloudflare.com/mcp'
+
+// Automatically enrich `search` tool results with upstream documentation. Flip to
+// false to disable pairing without touching the proxy logic.
+const DOCS_PAIRING_ENABLED = true
 
 /**
  * Inject the configured account id into upstream `execute` tool calls.
@@ -97,6 +110,114 @@ export async function isAuthorizedBearer(
   }
 }
 
+/** Copy upstream headers and apply the request's CORS allowances. */
+function withCorsHeaders(upstream: Headers, origin: string): Headers {
+  const headers = new Headers(upstream)
+  if (origin) {
+    headers.set('Access-Control-Allow-Origin', origin)
+    headers.set('Vary', 'Origin')
+  }
+  return headers
+}
+
+// Per-isolate cache of the resolved upstream docs tool name. `undefined` = not
+// yet discovered; a string = the tool name; a failed discovery is not cached
+// (the promise is cleared) so a later request retries.
+let docsToolDiscovery: Promise<string | null> | null = null
+
+async function discoverDocsToolName(target: string, baseHeaders: Headers): Promise<string | null> {
+  try {
+    const headers = new Headers(baseHeaders)
+    headers.set('Content-Type', 'application/json')
+    headers.set('Accept', 'application/json, text/event-stream')
+    headers.delete('Content-Length')
+    const resp = await fetch(target, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'docs-discovery', method: 'tools/list' })
+    })
+    if (!resp.ok) return null
+    return pickDocsToolName(parseRpc(await resp.text()))
+  } catch {
+    return null
+  }
+}
+
+async function resolveDocsToolName(target: string, baseHeaders: Headers): Promise<string | null> {
+  if (!docsToolDiscovery) docsToolDiscovery = discoverDocsToolName(target, baseHeaders)
+  const name = await docsToolDiscovery
+  if (name === null) docsToolDiscovery = null // allow a later retry after a miss
+  return name
+}
+
+/**
+ * Proxy a `search` tool call and, when possible, enrich its result with upstream
+ * documentation. The search request always runs; the docs request runs in
+ * parallel. On any uncertainty — no derivable query, no docs tool, a non-JSON
+ * (e.g. streamed) search response, or a failed/empty docs call — the untouched
+ * search response is returned, so `search` behaviour never regresses.
+ */
+async function proxySearchWithDocs(
+  target: string,
+  headers: Headers,
+  body: string,
+  args: Record<string, unknown>,
+  origin: string
+): Promise<Response> {
+  const query = deriveDocsQuery(args)
+  const searchPromise = fetch(target, { method: 'POST', headers, body, redirect: 'follow' })
+
+  let docsToolName: string | null = null
+  let docsPromise: Promise<Response | null> = Promise.resolve(null)
+  if (query) {
+    docsToolName = await resolveDocsToolName(target, headers)
+    if (docsToolName) {
+      const docsHeaders = new Headers(headers)
+      docsHeaders.set('Content-Type', 'application/json')
+      docsHeaders.set('Accept', 'application/json, text/event-stream')
+      docsHeaders.delete('Content-Length')
+      docsPromise = fetch(target, {
+        method: 'POST',
+        headers: docsHeaders,
+        body: buildDocsRequestBody(docsToolName, query),
+        redirect: 'follow'
+      }).catch(() => null)
+    }
+  }
+
+  const searchResp = await searchPromise
+  const contentType = searchResp.headers.get('Content-Type') ?? ''
+  const passthrough = () =>
+    new Response(searchResp.body, {
+      status: searchResp.status,
+      statusText: searchResp.statusText,
+      headers: withCorsHeaders(searchResp.headers, origin)
+    })
+
+  // Only merge into a plain-JSON search response; stream anything else through.
+  if (!query || !docsToolName || !contentType.includes('application/json')) {
+    return passthrough()
+  }
+
+  const searchText = await searchResp.text()
+  const searchRpc = parseRpc(searchText)
+  let outText = searchText
+  const docsResp = await docsPromise
+  if (docsResp && searchRpc) {
+    const docsText = extractToolText(parseRpc(await docsResp.text().catch(() => '')))
+    if (docsText) outText = JSON.stringify(mergeDocsIntoSearch(searchRpc, docsText, query))
+  }
+
+  const outHeaders = withCorsHeaders(searchResp.headers, origin)
+  outHeaders.set('Content-Type', 'application/json')
+  outHeaders.delete('Content-Length') // body length changed
+  return new Response(outText, {
+    status: searchResp.status,
+    statusText: searchResp.statusText,
+    headers: outHeaders
+  })
+}
+
 export const ALL: APIRoute = async ({ request, url }) => {
   const origin = request.headers.get('Origin') ?? '*'
 
@@ -166,21 +287,36 @@ export const ALL: APIRoute = async ({ request, url }) => {
   forwardedHeaders.set('Host', targetUrl.hostname)
   forwardedHeaders.set('Authorization', `Bearer ${cfApiToken}`)
 
-  // Behind-the-scenes account-id injection for `execute` tool calls. Only bodies
-  // that carry a request (POST) and only when the account id is configured.
+  // Read the request body once (POST only). It is needed both for behind-the-scenes
+  // account-id injection on `execute` calls and to detect a `search` call for docs
+  // pairing. Non-POST / empty requests stream through untouched.
   let forwardedBody: BodyInit | null | undefined = request.body
-  // A missing/rotated secret or a transient store error must not 500 the whole
-  // proxy — account injection is an enhancement, not load-bearing. Fall back to
-  // no injection on any failure.
-  const accountId = await env.CLOUDFLARE_ACCOUNT_ID.get().catch(() => null)
-  if (accountId && request.method === 'POST' && request.body) {
-    const rewritten = injectAccountId(await request.text(), accountId)
-    forwardedBody = rewritten
-    // Body length changed vs. the original stream — let fetch recompute it.
+  let searchCall: { id: unknown; args: Record<string, unknown> } | null = null
+  if (request.method === 'POST' && request.body) {
+    const rawBody = await request.text()
+    // A missing/rotated secret or a transient store error must not 500 the whole
+    // proxy — account injection is an enhancement, not load-bearing.
+    const accountId = await env.CLOUDFLARE_ACCOUNT_ID.get().catch(() => null)
+    forwardedBody = accountId ? injectAccountId(rawBody, accountId) : rawBody
+    // The forwarded body is a re-serialized string; its length may differ from the
+    // original header, so let fetch recompute Content-Length.
     forwardedHeaders.delete('Content-Length')
+    if (DOCS_PAIRING_ENABLED) searchCall = detectSearchCall(parseRpc(forwardedBody))
   }
 
   try {
+    // `search` calls are enriched with upstream docs; everything else is a plain
+    // proxy. Pairing owns the search fetch, so it isn't also run below.
+    if (searchCall) {
+      return await proxySearchWithDocs(
+        targetUrl.toString(),
+        forwardedHeaders,
+        typeof forwardedBody === 'string' ? forwardedBody : '',
+        searchCall.args,
+        origin
+      )
+    }
+
     const upstreamResponse = await fetch(targetUrl.toString(), {
       method: request.method,
       headers: forwardedHeaders,
@@ -188,16 +324,10 @@ export const ALL: APIRoute = async ({ request, url }) => {
       redirect: 'follow'
     })
 
-    const responseHeaders = new Headers(upstreamResponse.headers)
-    if (origin) {
-      responseHeaders.set('Access-Control-Allow-Origin', origin)
-      responseHeaders.set('Vary', 'Origin')
-    }
-
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
-      headers: responseHeaders
+      headers: withCorsHeaders(upstreamResponse.headers, origin)
     })
   } catch (err) {
     console.error('Failed to proxy request to upstream MCP:', err)

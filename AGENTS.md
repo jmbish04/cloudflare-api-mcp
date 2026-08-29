@@ -34,6 +34,7 @@ cloudflare-api-mcp/
 │   ├── lib/
 │   │   ├── oauth.ts                    # Pure PKCE (S256) + redirect-uri allowlist helpers (no Worker bindings)
 │   │   ├── token-grants.ts             # Pure /token grant logic (KV injected) — authorization_code + refresh_token
+│   │   ├── docs-pairing.ts             # Pure helpers to enrich `search` results with upstream docs
 │   │   └── utils.ts                    # cn() etc.
 │   ├── components/                     # React islands: LandingPage, AuthorizePage, LoginForm, ui/, reui/, blocks/
 │   ├── layouts/Layout.astro
@@ -43,6 +44,7 @@ cloudflare-api-mcp/
 │   ├── oauth-pkce.test.ts             # PKCE (RFC 7636 vector) + redirect allowlist — pure
 │   ├── token-grants.test.ts           # /token grant paths against an in-memory KV — pure
 │   ├── mcp-auth.test.ts               # /mcp bearer validation (isAuthorizedBearer)
+│   ├── docs-pairing.test.ts           # search→docs pairing transforms — pure
 │   └── inject-account-id.test.ts      # account_id injection into execute calls
 ├── astro.config.mjs                   # Astro + @astrojs/cloudflare + react + tailwind(v4 via @tailwindcss/vite)
 ├── wrangler.jsonc                     # Worker config: bindings, vars, preview_urls
@@ -102,6 +104,13 @@ A `package-lock.json` is also committed (GitHub Actions uses `npm ci`); keep bot
 
 ### account_id injection
 `injectAccountId` (in `mcp.ts`) splices the configured `CLOUDFLARE_ACCOUNT_ID` into `tools/call` bodies for the `execute` tool when the arg is absent, so multi-account user tokens resolve the right account. Other tools are untouched; an existing `account_id` is never overwritten. Failures fall back to no injection (best-effort, never 500s the proxy).
+
+### Docs pairing (search → docs)
+When a client calls the `search` tool, the proxy also calls the upstream **docs** tool and appends the documentation to the search result, so the agent gets endpoint methods/payloads *and* product context from one call. Pure transforms live in `lib/docs-pairing.ts` (`detectSearchCall`, `deriveDocsQuery`, `pickDocsToolName`, `extractToolText`, `mergeDocsIntoSearch`); `mcp.ts` does the I/O:
+
+- The docs query is derived from the search `code`'s string literals (product/tag/path terms, stopwords removed), or taken from an explicit `docs_query` argument.
+- The docs tool name is discovered from the upstream `tools/list` (cached per isolate; falls back gracefully), since the upstream may name it `docs` or similar.
+- Search and docs fetch in parallel. **It fails safe:** on no derivable query, no docs tool, a non-JSON (streamed) search response, or a failed/empty docs call, the untouched search response is returned — pairing can never degrade `search`. Toggle with `DOCS_PAIRING_ENABLED` in `mcp.ts`.
 
 ### Bindings (`wrangler.jsonc`)
 - **KV:** `SESSION` (Astro sessions), `OAUTH_KV` (tokens, codes, refresh, client registrations).
