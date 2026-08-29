@@ -17,6 +17,7 @@ MCP client (Claude)                 your worker                     upstream
 - **Fronts the Cloudflare API MCP server** with your own URL and auth.
 - **Keeps the privileged token server-side** — the client only ever holds a short opaque `mcp_at_…` token this worker issues.
 - **Injects `account_id`** into `execute` tool calls automatically, so a multi-account user token resolves the right account without the model supplying it.
+- **Pairs `search` with docs** — when the agent searches for endpoints, the proxy also queries Cloudflare's separate documentation MCP (`docs.mcp.cloudflare.com`, no privileged token) and appends that context to the result, so the agent gets both the methods/payloads *and* how the product works. Fails safe: if docs can't be fetched, the plain search result is returned unchanged.
 - **Serves a landing page + OAuth consent screen** (Astro + React/shadcn/ReUI).
 
 ## Connect a client

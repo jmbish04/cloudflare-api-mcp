@@ -34,6 +34,7 @@ cloudflare-api-mcp/
 │   ├── lib/
 │   │   ├── oauth.ts                    # Pure PKCE (S256) + redirect-uri allowlist helpers (no Worker bindings)
 │   │   ├── token-grants.ts             # Pure /token grant logic (KV injected) — authorization_code + refresh_token
+│   │   ├── docs-pairing.ts             # Pure helpers to enrich `search` results with upstream docs
 │   │   └── utils.ts                    # cn() etc.
 │   ├── components/                     # React islands: LandingPage, AuthorizePage, LoginForm, ui/, reui/, blocks/
 │   ├── layouts/Layout.astro
@@ -43,6 +44,7 @@ cloudflare-api-mcp/
 │   ├── oauth-pkce.test.ts             # PKCE (RFC 7636 vector) + redirect allowlist — pure
 │   ├── token-grants.test.ts           # /token grant paths against an in-memory KV — pure
 │   ├── mcp-auth.test.ts               # /mcp bearer validation (isAuthorizedBearer)
+│   ├── docs-pairing.test.ts           # search→docs pairing transforms — pure
 │   └── inject-account-id.test.ts      # account_id injection into execute calls
 ├── astro.config.mjs                   # Astro + @astrojs/cloudflare + react + tailwind(v4 via @tailwindcss/vite)
 ├── wrangler.jsonc                     # Worker config: bindings, vars, preview_urls
@@ -102,6 +104,14 @@ A `package-lock.json` is also committed (GitHub Actions uses `npm ci`); keep bot
 
 ### account_id injection
 `injectAccountId` (in `mcp.ts`) splices the configured `CLOUDFLARE_ACCOUNT_ID` into `tools/call` bodies for the `execute` tool when the arg is absent, so multi-account user tokens resolve the right account. Other tools are untouched; an existing `account_id` is never overwritten. Failures fall back to no injection (best-effort, never 500s the proxy).
+
+### Docs pairing (search → docs)
+When a client calls the `search` tool, the proxy also queries **Cloudflare's separate documentation MCP server** (`DOCS_MCP_URL` = `https://docs.mcp.cloudflare.com/mcp`) and appends the documentation to the search result, so the agent gets endpoint methods/payloads *and* product context from one call. Pure transforms live in `lib/docs-pairing.ts` (`detectSearchCall`, `deriveDocsQuery`, `pickDocsToolName`, `extractToolText`, `mergeDocsIntoSearch`); `mcp.ts` does the I/O:
+
+- **Two servers:** `search` is forwarded to the API upstream (`UPSTREAM_MCP_URL`) as usual; the docs call goes to the public docs MCP (`DOCS_MCP_URL`) and **carries no privileged token** (a different, unauthenticated service).
+- The docs tool is `DOCS_TOOL_NAME` = `search_cloudflare_documentation`, called with a `query` argument.
+- The docs query is derived from the search `code`'s string literals (product/tag/path terms, stopwords removed), or taken from an explicit `docs_query` argument.
+- Search and docs fetch in parallel. **It fails safe:** on no derivable query, a non-JSON (streamed) search response, or a failed/empty docs call, the untouched search response is returned — pairing can never degrade `search`. Toggle with `DOCS_PAIRING_ENABLED` in `mcp.ts`.
 
 ### Bindings (`wrangler.jsonc`)
 - **KV:** `SESSION` (Astro sessions), `OAUTH_KV` (tokens, codes, refresh, client registrations).
