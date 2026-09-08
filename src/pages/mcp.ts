@@ -10,6 +10,7 @@ import {
   mergeDocsIntoSearch,
   parseRpc
 } from '../lib/docs-pairing'
+import { isBufferableResponse, shouldRetryWithUserToken } from '../lib/upstream-auth'
 
 export const prerender = false
 
@@ -157,6 +158,101 @@ async function fetchDocsWithTimeout(
 }
 
 /**
+ * The outcome of one upstream attempt.
+ *
+ * `text` holds the buffered body when the response was safe to read to
+ * completion (see `isBufferableResponse`) and is `null` for a genuinely
+ * open-ended stream, which therefore cannot be inspected for a payload-level
+ * auth failure. `isJson` distinguishes a plain-JSON body — the only shape the
+ * docs-pairing merge can rewrite — from buffered SSE, which is replayed verbatim.
+ */
+type UpstreamResult = {
+  resp: Response
+  text: string | null
+  isJson: boolean
+  usedFallback: boolean
+}
+
+/**
+ * Forward to the upstream MCP with the account token, falling back to the user
+ * token when the account token is refused.
+ *
+ * Cloudflare splits its API across two token kinds and some surfaces — Workers
+ * Builds logs among them — are reachable *only* with a user-scoped token. Rather
+ * than pick one globally, the least-privileged token is tried first and the user
+ * token is used only for the calls that the first token cannot make.
+ *
+ * The refusal can arrive as an HTTP 401/403 from the upstream itself, or as an
+ * ordinary 200 whose tool result carries the Cloudflare API's own auth error —
+ * `shouldRetryWithUserToken` covers both.
+ *
+ * ponytail: a retry re-runs the sandboxed `execute` code from the top. That is
+ * safe for the read-shaped calls this exists for (build logs, listings) but a
+ * script that wrote something *before* hitting the refusal would write it twice.
+ * Narrow matching keeps the retry rare; make it read-only-gated if that ever bites.
+ *
+ * @param body must be a string or null to be retryable — a streamed request body
+ *   cannot be replayed, so such a request is never retried.
+ */
+async function fetchUpstreamWithFallback(
+  target: string,
+  headers: Headers,
+  method: string,
+  body: BodyInit | null | undefined,
+  primaryToken: string,
+  fallbackToken: string | null
+): Promise<UpstreamResult> {
+  const attempt = async (token: string): Promise<UpstreamResult> => {
+    const attemptHeaders = new Headers(headers)
+    attemptHeaders.set('Authorization', `Bearer ${token}`)
+    const resp = await fetch(target, {
+      method,
+      headers: attemptHeaders,
+      body,
+      redirect: 'follow'
+    })
+    const contentType = resp.headers.get('Content-Type') ?? ''
+    const text = isBufferableResponse(method, contentType) ? await resp.text() : null
+    return { resp, text, isJson: contentType.includes('application/json'), usedFallback: false }
+  }
+
+  const refused = (r: UpstreamResult): boolean => shouldRetryWithUserToken(r.resp.status, r.text)
+
+  const first = await attempt(primaryToken)
+  const replayable = body == null || typeof body === 'string'
+  if (!fallbackToken || !replayable || !refused(first)) return first
+
+  const second = await attempt(fallbackToken)
+  // Keep the retry only if the user token actually cleared the refusal. If it was
+  // refused too, the original (least-privileged) response is the more honest error
+  // to hand back — and it avoids reporting a user-token failure for an account-token call.
+  return refused(second) ? first : { ...second, usedFallback: true }
+}
+
+/** Rebuild a client-facing response from an upstream attempt, applying CORS. */
+function upstreamToResponse(result: UpstreamResult, origin: string): Response {
+  const headers = withCorsHeaders(result.resp.headers, origin)
+  if (result.text === null) {
+    return new Response(result.resp.body, {
+      status: result.resp.status,
+      statusText: result.resp.statusText,
+      headers
+    })
+  }
+  // The body is decoded plaintext we are re-serializing, so drop any framing or
+  // encoding headers copied from upstream — otherwise a client could try to
+  // gunzip an identity body.
+  headers.delete('Content-Length')
+  headers.delete('Content-Encoding')
+  headers.delete('Transfer-Encoding')
+  return new Response(result.text, {
+    status: result.resp.status,
+    statusText: result.resp.statusText,
+    headers
+  })
+}
+
+/**
  * Proxy a `search` tool call and, when possible, enrich its result with docs.
  *
  * The search request runs against the API upstream; the docs request runs in
@@ -166,9 +262,7 @@ async function fetchDocsWithTimeout(
  * the untouched search response is returned, so `search` behaviour never regresses.
  */
 async function proxySearchWithDocs(
-  apiTarget: string,
-  apiHeaders: Headers,
-  searchBody: string,
+  searchFetch: () => Promise<UpstreamResult>,
   docsTarget: string,
   docsHeaders: Headers,
   docsToolName: string,
@@ -176,32 +270,24 @@ async function proxySearchWithDocs(
   origin: string
 ): Promise<Response> {
   const query = deriveDocsQuery(args)
-  const searchPromise = fetch(apiTarget, {
-    method: 'POST',
-    headers: apiHeaders,
-    body: searchBody,
-    redirect: 'follow'
-  })
+  // The search request goes through the token-fallback path like any other call,
+  // so a search refused by the account token is retried with the user token.
+  const searchPromise = searchFetch()
 
   const docsPromise: Promise<Response | null> = query
     ? fetchDocsWithTimeout(docsTarget, docsHeaders, buildDocsRequestBody(docsToolName, query))
     : Promise.resolve(null)
 
-  const searchResp = await searchPromise
-  const contentType = searchResp.headers.get('Content-Type') ?? ''
-  const passthrough = () =>
-    new Response(searchResp.body, {
-      status: searchResp.status,
-      statusText: searchResp.statusText,
-      headers: withCorsHeaders(searchResp.headers, origin)
-    })
+  const search = await searchPromise
 
-  // Only merge into a plain-JSON search response; stream anything else through.
-  if (!query || !contentType.includes('application/json')) {
-    return passthrough()
+  // Only merge into a plain-JSON search response. Buffered SSE is replayed
+  // verbatim rather than rewritten — the merge operates on a JSON-RPC document,
+  // not on event framing.
+  if (!query || search.text === null || !search.isJson) {
+    return upstreamToResponse(search, origin)
   }
 
-  const searchText = await searchResp.text()
+  const searchText = search.text
   const searchRpc = parseRpc(searchText)
   let outText = searchText
   const docsResp = await docsPromise
@@ -210,19 +296,9 @@ async function proxySearchWithDocs(
     if (docsText) outText = JSON.stringify(mergeDocsIntoSearch(searchRpc, docsText, query))
   }
 
-  const outHeaders = withCorsHeaders(searchResp.headers, origin)
-  outHeaders.set('Content-Type', 'application/json')
-  // The body here is decoded plaintext we re-serialized, so drop any framing/
-  // encoding headers copied from the upstream response — otherwise a client could
-  // try to gunzip an identity body and fail to decode a result we promised to keep.
-  outHeaders.delete('Content-Length')
-  outHeaders.delete('Content-Encoding')
-  outHeaders.delete('Transfer-Encoding')
-  return new Response(outText, {
-    status: searchResp.status,
-    statusText: searchResp.statusText,
-    headers: outHeaders
-  })
+  const merged = upstreamToResponse({ ...search, text: outText }, origin)
+  merged.headers.set('Content-Type', 'application/json')
+  return merged
 }
 
 export const ALL: APIRoute = async ({ request, url }) => {
@@ -286,13 +362,22 @@ export const ALL: APIRoute = async ({ request, url }) => {
     )
   }
 
+  // Optional second credential. Some Cloudflare API surfaces (Workers Builds logs,
+  // for one) are only reachable with a *user* token, so calls the account token is
+  // refused for are retried with this one. Absent or unreadable → no fallback, and
+  // the proxy behaves exactly as it did before.
+  const cfUserApiToken =
+    (await env?.CLOUDFLARE_USER_WRANGLER_API_TOKEN?.get?.().catch(() => null)) ?? null
+
   const upstreamBase = env?.UPSTREAM_MCP_URL || DEFAULT_UPSTREAM
   const targetUrl = new URL(upstreamBase)
   targetUrl.search = url.search
 
   const forwardedHeaders = new Headers(request.headers)
   forwardedHeaders.set('Host', targetUrl.hostname)
-  forwardedHeaders.set('Authorization', `Bearer ${cfApiToken}`)
+  // Authorization is set per attempt by fetchUpstreamWithFallback; the client's
+  // own bearer must not survive onto the upstream request.
+  forwardedHeaders.delete('Authorization')
 
   // Read the request body once (POST only). It is needed both for behind-the-scenes
   // account-id injection on `execute` calls and to detect a `search` call for docs
@@ -315,11 +400,19 @@ export const ALL: APIRoute = async ({ request, url }) => {
     // `search` calls are enriched with Cloudflare docs; everything else is a plain
     // proxy. Pairing owns the search fetch, so it isn't also run below. Docs go to
     // the separate, public docs MCP server (never the privileged API token).
-    if (searchCall) {
-      return await proxySearchWithDocs(
+    const callUpstream = (body: BodyInit | null | undefined) =>
+      fetchUpstreamWithFallback(
         targetUrl.toString(),
         forwardedHeaders,
-        typeof forwardedBody === 'string' ? forwardedBody : '',
+        request.method,
+        body,
+        cfApiToken,
+        cfUserApiToken
+      )
+
+    if (searchCall) {
+      return await proxySearchWithDocs(
+        () => callUpstream(typeof forwardedBody === 'string' ? forwardedBody : ''),
         DOCS_MCP_URL,
         buildDocsHeaders(request.headers.get('MCP-Protocol-Version')),
         DOCS_TOOL_NAME,
@@ -328,18 +421,7 @@ export const ALL: APIRoute = async ({ request, url }) => {
       )
     }
 
-    const upstreamResponse = await fetch(targetUrl.toString(), {
-      method: request.method,
-      headers: forwardedHeaders,
-      body: forwardedBody,
-      redirect: 'follow'
-    })
-
-    return new Response(upstreamResponse.body, {
-      status: upstreamResponse.status,
-      statusText: upstreamResponse.statusText,
-      headers: withCorsHeaders(upstreamResponse.headers, origin)
-    })
+    return upstreamToResponse(await callUpstream(forwardedBody), origin)
   } catch (err) {
     console.error('Failed to proxy request to upstream MCP:', err)
     return new Response(

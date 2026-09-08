@@ -63,7 +63,7 @@ For Cloudflare Workers Builds (dash CI/CD), set the **Deploy command** to `pnpm 
 `wrangler.jsonc` declares the bindings the worker needs:
 
 - **KV:** `SESSION` (Astro sessions), `OAUTH_KV` (issued tokens, auth codes, client registrations)
-- **Secrets Store:** `WORKER_API_KEY` (the access gate), `CLOUDFLARE_WRANGLER_API_TOKEN` (privileged token forwarded upstream), `CLOUDFLARE_ACCOUNT_ID` (injected into `execute`), `REUI_LICENSE_KEY`
+- **Secrets Store:** `WORKER_API_KEY` (the access gate), `CLOUDFLARE_WRANGLER_API_TOKEN` (privileged token forwarded upstream), `CLOUDFLARE_USER_WRANGLER_API_TOKEN` (user-scoped fallback for API surfaces an account token cannot reach — Workers Builds logs, for one), `CLOUDFLARE_ACCOUNT_ID` (injected into `execute`), `REUI_LICENSE_KEY`
 - **Var:** `UPSTREAM_MCP_URL` (defaults to `https://mcp.cloudflare.com/mcp`)
 - `preview_urls` is `false` — see DEPLOY.md.
 
