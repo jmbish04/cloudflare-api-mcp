@@ -41,6 +41,14 @@
       "store_id": "8c42fa70938644e0a8a109744467375f",
       "secret_name": "CLOUDFLARE_WRANGLER_API_TOKEN"
     },
+    // Fallback credential for Cloudflare API surfaces that only accept a *user*
+    // token (Workers Builds logs, for one). Used only when the account-scoped
+    // token above is refused; see src/lib/upstream-auth.ts.
+    {
+      "binding": "CLOUDFLARE_USER_WRANGLER_API_TOKEN",
+      "store_id": "8c42fa70938644e0a8a109744467375f",
+      "secret_name": "CLOUDFLARE_USER_WRANGLER_API_TOKEN"
+    },
     {
       "binding": "REUI_LICENSE_KEY",
       "store_id": "8c42fa70938644e0a8a109744467375f",

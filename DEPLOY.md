@@ -55,10 +55,10 @@ To stop Workers Builds from *attempting* per-PR preview deployments at all, turn
 `wrangler.jsonc` declares these; the Worker will not function without them:
 
 - **KV namespaces:** `SESSION`, `OAUTH_KV`
-- **Secrets Store secrets:** `WORKER_API_KEY`, `CLOUDFLARE_WRANGLER_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `REUI_LICENSE_KEY`
+- **Secrets Store secrets:** `WORKER_API_KEY`, `CLOUDFLARE_WRANGLER_API_TOKEN`, `CLOUDFLARE_USER_WRANGLER_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `REUI_LICENSE_KEY`
 - **Var:** `UPSTREAM_MCP_URL`
 
-`WORKER_API_KEY` is the value entered on the `/authorize` page during the OAuth flow; `CLOUDFLARE_WRANGLER_API_TOKEN` is the privileged token the `/mcp` proxy forwards upstream.
+`WORKER_API_KEY` is the value entered on the `/authorize` page during the OAuth flow; `CLOUDFLARE_WRANGLER_API_TOKEN` is the privileged token the `/mcp` proxy forwards upstream. `CLOUDFLARE_USER_WRANGLER_API_TOKEN` is a user-scoped token used only when the account-scoped one is refused (Workers Builds returns `12006 "Invalid token"` to an account token); the proxy still works without it, minus those endpoints.
 
 ## Verifying a deploy
 
