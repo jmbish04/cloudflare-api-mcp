@@ -114,7 +114,7 @@ For Cloudflare Workers Builds (dash CI/CD), set the **Deploy command** to `pnpm 
 
 - **KV:** `SESSION` (Astro sessions), `OAUTH_KV` (issued tokens, auth codes, client registrations)
 - **D1:** `CICD_DB` — pause/resume state and the failure-pattern library. Schema is Drizzle (`src/db/schema.ts`): `pnpm run db:generate` to write a migration, `pnpm run db:migrate` to apply it.
-- **Secrets Store:** `WORKER_API_KEY` (the access gate), `CLOUDFLARE_WRANGLER_API_TOKEN` (privileged token forwarded upstream), `CLOUDFLARE_USER_WRANGLER_API_TOKEN` (the CI/CD tools — see the note below), `GH_TOKEN` (read-only, for PR correlation), `CLOUDFLARE_ACCOUNT_ID` (injected into `execute`), `REUI_LICENSE_KEY`
+- **Secrets Store:** `WORKER_API_KEY` (the access gate), `CLOUDFLARE_WRANGLER_API_TOKEN` (privileged token forwarded upstream), `CLOUDFLARE_USER_WRANGLER_API_TOKEN` (the CI/CD tools, and the proxy's fallback for API surfaces an account token cannot reach — see the note below), `GH_TOKEN` (read-only, for PR correlation), `CLOUDFLARE_ACCOUNT_ID` (injected into `execute`), `REUI_LICENSE_KEY`
 - **Var:** `UPSTREAM_MCP_URL` (defaults to `https://mcp.cloudflare.com/mcp`)
 - `preview_urls` is `false` — see DEPLOY.md.
 

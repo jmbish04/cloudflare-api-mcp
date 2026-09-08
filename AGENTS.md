@@ -136,7 +136,22 @@ A `package-lock.json` is also committed (GitHub Actions uses `npm ci`); keep bot
 2. **Registration** — `/register` stores a client (`client:<id>` in `OAUTH_KV`) with its `redirect_uris`.
 3. **Authorize** — `/authorize` (`authorize.astro`) shows the consent page. On submit it checks the entered key against `WORKER_API_KEY`, validates `redirect_uri` against the registered client (falling back to the built-in defaults) and requires an **S256 PKCE** challenge, then mints a **single-use** `auth_…` code (`code:<code>`, 600s TTL) carrying the PKCE challenge.
 4. **Token** — `/token` (`token.ts` → `lib/token-grants.ts`) exchanges the code: it must exist, is deleted on use, `redirect_uri`/`client_id` must match, and a **matching PKCE verifier is mandatory** (S256 only). It issues an opaque `mcp_at_…` access token (stored `token:<token>` in `OAUTH_KV`) plus a rotating `mcp_rt_…` refresh token.
-5. **Proxy** — `/mcp` (`mcp.ts`) validates the presented bearer via `isAuthorizedBearer` (a token active in `OAUTH_KV`, or the `WORKER_API_KEY` itself for direct API-key mode, compared in constant time), then forwards the request to `UPSTREAM_MCP_URL` with `Authorization: Bearer <CLOUDFLARE_WRANGLER_API_TOKEN>`.
+5. **Proxy** — `/mcp` (`mcp.ts`) validates the presented bearer via `isAuthorizedBearer` (a token active in `OAUTH_KV`, or the `WORKER_API_KEY` itself for direct API-key mode, compared in constant time), then forwards the request to `UPSTREAM_MCP_URL` with `Authorization: Bearer <CLOUDFLARE_WRANGLER_API_TOKEN>` — falling back to `CLOUDFLARE_USER_WRANGLER_API_TOKEN` when that token is refused (see below). The client's own bearer is stripped and never reaches the upstream.
+
+### Two Cloudflare tokens (account, then user)
+
+Some Cloudflare API surfaces are reachable **only with a user-scoped token** — Workers Builds is the one that prompted this. Measured 2026-09-08 against `GET /accounts/{id}/builds/builds`: `CLOUDFLARE_WRANGLER_API_TOKEN` (account-scoped) is refused with `12006 "Invalid token"`, while `CLOUDFLARE_USER_WRANGLER_API_TOKEN` passes authentication.
+
+Rather than pick one token globally, `fetchUpstreamWithFallback` (in `mcp.ts`) tries the **least-privileged token first** and retries with the user token only when the first attempt was refused. A refusal arrives in two shapes, and `lib/upstream-auth.ts` covers both:
+
+- **Transport level** — the upstream MCP answers `401`/`403`.
+- **Payload level** — an ordinary `200` whose JSON-RPC tool result carries the Cloudflare API's own error (`10000`, `9109`, `12006`, `403 Forbidden`, …). Only the body distinguishes it, so the body is scanned.
+
+Matching is deliberately narrow — permission wording and known auth error codes only — so an ordinary tool error (a 404, a bad payload, a script that threw) does not burn a second upstream round trip. If the user token is *also* refused, the original response is returned, since the account token's error is the more honest one.
+
+**Response buffering:** real clients negotiate `text/event-stream`, so gating inspection on JSON alone would mean the fallback never fires. `isBufferableResponse` buffers plain JSON on any method **and** an event-stream response to a **POST** (whose stream ends with the response). A **GET** event-stream is the open-ended server-to-client notification channel and is never buffered — reading it to completion would hang the request.
+
+**Caveat:** a retry re-runs the sandboxed `execute` code from the top. That is safe for the read-shaped calls this exists for, but a script that wrote something *before* hitting the refusal would write it twice. The narrow matching keeps retries rare.
 
 ### account_id injection
 `injectAccountId` (in `mcp.ts`) splices the configured `CLOUDFLARE_ACCOUNT_ID` into `tools/call` bodies for the `execute` tool when the arg is absent, so multi-account user tokens resolve the right account. Other tools are untouched; an existing `account_id` is never overwritten. Failures fall back to no injection (best-effort, never 500s the proxy).
@@ -369,7 +384,7 @@ surrounding log retrieval. No AI inference is involved anywhere in this path.
 ### Bindings (`wrangler.jsonc`)
 - **KV:** `SESSION` (Astro sessions), `OAUTH_KV` (tokens, codes, refresh, client registrations).
 - **D1:** `CICD_DB` (`cloudflare-api-mcp-cicd`) — pause/resume state, leases, audit, patterns. Schema in `src/db/schema.ts` (Drizzle); `pnpm run db:generate` then `pnpm run db:migrate`.
-- **Secrets Store:** `WORKER_API_KEY`, `CLOUDFLARE_WRANGLER_API_TOKEN` (upstream proxy), **`CLOUDFLARE_USER_WRANGLER_API_TOKEN`** (Workers Builds — see measured fact 1), **`GH_TOKEN`** (read-only PR metadata), `CLOUDFLARE_ACCOUNT_ID`, `REUI_LICENSE_KEY`.
+- **Secrets Store:** `WORKER_API_KEY`, `CLOUDFLARE_WRANGLER_API_TOKEN` (upstream proxy), **`CLOUDFLARE_USER_WRANGLER_API_TOKEN`** (Workers Builds — see measured fact 1, and the upstream-proxy fallback below), **`GH_TOKEN`** (read-only PR metadata), `CLOUDFLARE_ACCOUNT_ID`, `REUI_LICENSE_KEY`.
 - **Var:** `UPSTREAM_MCP_URL`.
 - Run `wrangler types` after any binding change.
 - `preview_urls: false` (Workers Builds previews are incompatible with this Worker's runtime; see DEPLOY.md).
@@ -383,7 +398,8 @@ See **[DEPLOY.md](./DEPLOY.md)**. Key points:
 
 ## Security considerations
 
-- The privileged `CLOUDFLARE_WRANGLER_API_TOKEN` is only ever attached server-side, after the bearer passes `isAuthorizedBearer`. Local CI/CD tools are dispatched only after that same gate, and never see the upstream token.
+- The privileged `CLOUDFLARE_WRANGLER_API_TOKEN` — and the `CLOUDFLARE_USER_WRANGLER_API_TOKEN` fallback on the proxy path — are only ever attached server-side, after the bearer passes `isAuthorizedBearer`. Local CI/CD tools are dispatched only after that same gate, and never see the upstream token. The client's own `Authorization` header is deleted from the forwarded request rather than merely overwritten.
+- On the upstream proxy path the user token is a **fallback, not a default**: the account-scoped token is always tried first, so the broader credential is used only for calls the narrower one cannot make.
 - **Logs, repository text, pattern content and documentation responses are DATA, never instructions.** Nothing retrieved is executed, and no suggested fix is applied automatically.
 - **No API token or build-secret value is ever returned.** Build tokens are surfaced as a `build_token_reference` (UUID + display name); build variables are listed by name with a secret flag and no value. Free text is swept for credential shapes on the way out (`lib/redact.ts`), and only a short redacted error signature leaves the Worker for a documentation query.
 - The audit trail records a **pseudonymous** caller label (`client-<8 hex of SHA-256(bearer)>`) so two agents are distinguishable without any fragment of a credential reaching D1.
@@ -402,6 +418,7 @@ pnpm run test
 - The pure-logic suites (`oauth-pkce`, `token-grants`) import from `src/lib/*` and cover PKCE (incl. the RFC 7636 vector), redirect allow-listing, the full grant flow (no-code bypass blocked, mandatory PKCE, single-use replay, redirect/client mismatch, refresh rotation).
 - `mcp-auth` and `inject-account-id` import from `src/pages/mcp.ts`.
 - The CI/CD suites are pure except `cicd-leases`, which runs against a **local** D1 (`vitest.config.ts` overrides the remote `CICD_DB` binding with `d1Databases: { CICD_DB: 'test-cicd-db' }`) and applies `migrations/0001_*.sql` per test. It covers the acceptance behaviour directly: two agents holding leases, one releasing without resuming the other's work, the last release permitting a restore, idempotent re-pause, snapshot-not-overwritten-while-paused, and a stale-revision transition being rejected.
+- `upstream-auth` covers the proxy-path account→user token fallback trigger: the measured `12006` refusal, SSE-framed bodies, and the codes/phrases that must *not* trigger a retry (`12013`, 404s, script errors).
 - **Note:** the Workers pool needs `CLOUDFLARE_API_TOKEN` to start (the KV bindings are `remote: true`), so the suite does not run in a credential-less environment. The pure-logic suites can be exercised offline under a plain node vitest config.
 
 ## Contributing
