@@ -12,11 +12,13 @@
  * failure-pattern library.
  */
 
+import type { Db } from '../../db/client'
 import type { CloudflareBuildsClient } from '../cf-builds'
 import type { GitHubClient } from '../github'
 
 export interface ToolContext {
-  db: D1Database
+  /** Drizzle handle over the CICD_DB binding. */
+  db: Db
   cf: CloudflareBuildsClient
   gh: GitHubClient
   accountId: string

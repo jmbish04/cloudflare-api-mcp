@@ -12,7 +12,10 @@
     "format": "oxfmt --write src/",
     "format:check": "oxfmt --check src/",
     "test": "vitest run",
-    "check": "npm run format:check && npm run lint && npm run typecheck"
+    "check": "npm run format:check && npm run lint && npm run typecheck",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "wrangler d1 migrations apply CICD_DB --remote -c ./wrangler.jsonc",
+    "db:explain": "node scripts/explain-queries.mjs"
   },
   "dependencies": {
     "@astrojs/cloudflare": "14.2.1",
@@ -23,6 +26,7 @@
     "astro": "7.2.2",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
+    "drizzle-orm": "^0.45.2",
     "lucide-react": "1.31.0",
     "radix-ui": "^1.6.7",
     "react": "19.2.8",
@@ -36,6 +40,7 @@
     "@types/node": "^25.0.6",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
+    "drizzle-kit": "^0.31.10",
     "oxfmt": "^0.31.0",
     "oxlint": "^1.46.0",
     "typescript": "^5.7.0",
@@ -43,6 +48,10 @@
     "wrangler": "^4.103.0"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "sharp", "workerd"]
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "workerd"
+    ]
   }
 }

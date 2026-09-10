@@ -1,161 +1,149 @@
 /**
- * Pause/resume coordination state, persisted in D1.
+ * Pause/resume coordination state, persisted in D1 through Drizzle.
  *
  * D1 and the Cloudflare API cannot share a transaction, so every mutation writes
  * an intent row FIRST (`phase` = 'pausing' / 'resuming'), then calls Cloudflare,
  * then records the outcome. A crash between the two leaves a row that says
- * exactly what was in flight, which `reconcile()` can act on — as opposed to a
- * silent mismatch nobody can detect afterwards.
+ * exactly what was in flight, which `workers_cicd_reconcile` can act on — as
+ * opposed to a silent mismatch nobody can detect afterwards.
  *
- * The D1 binding is a parameter, never imported, so all of this is testable
- * against a local D1 without the Worker runtime.
+ * **Billing:** every read here is a primary-key or partial-index lookup, so it is
+ * billed for the rows it actually wants rather than a table scan. Writes are rare
+ * (pause, resume, configure) — the hot path in this Worker is pattern matching,
+ * not this file.
+ *
+ * The Drizzle handle is a parameter, never imported.
  */
 
+import { and, desc, eq, isNull, sql } from 'drizzle-orm'
+import type { Db } from '../db/client'
+import { cicdAudit, cicdLeases, cicdState } from '../db/schema'
+import type { CicdStateRow, LeaseRow } from '../db/schema'
+
 export type Phase = 'active' | 'pausing' | 'paused' | 'resuming'
-
-export interface CicdStateRow {
-  account_id: string
-  worker_name: string
-  worker_tag: string
-  phase: Phase
-  saved_config: string | null
-  saved_at: string | null
-  expected_config: string | null
-  revision: number
-  paused_at: string | null
-  updated_at: string
-}
-
-export interface LeaseRow {
-  lease_id: string
-  account_id: string
-  worker_name: string
-  worker_tag: string
-  owner: string
-  reason: string | null
-  idempotency_key: string | null
-  acquired_at: string
-  expires_at: string | null
-  released_at: string | null
-}
+export type { CicdStateRow, LeaseRow }
 
 const nowIso = () => new Date().toISOString()
 
 export async function getState(
-  db: D1Database,
+  db: Db,
   accountId: string,
   workerName: string
 ): Promise<CicdStateRow | null> {
-  return await db
-    .prepare('SELECT * FROM cicd_state WHERE account_id = ? AND worker_name = ?')
-    .bind(accountId, workerName)
-    .first<CicdStateRow>()
+  // Composite primary key: one row read, never a scan.
+  const rows = await db
+    .select()
+    .from(cicdState)
+    .where(and(eq(cicdState.accountId, accountId), eq(cicdState.workerName, workerName)))
+    .limit(1)
+  return rows[0] ?? null
 }
 
 /**
  * Move the row to a new phase, but only from an expected revision.
  *
  * The `revision = ?` predicate is the whole concurrency story: two agents that
- * read the same row and both try to transition it will produce one winner and
- * one `false`, and the loser re-reads rather than clobbering.
+ * read the same row and both try to transition it produce one winner and one
+ * `false`, and the loser re-reads rather than clobbering.
  */
 export async function transition(
-  db: D1Database,
+  db: Db,
   key: { accountId: string; workerName: string; workerTag: string },
   from: { revision: number } | null,
   next: Partial<
-    Pick<CicdStateRow, 'phase' | 'saved_config' | 'saved_at' | 'expected_config' | 'paused_at'>
+    Pick<CicdStateRow, 'phase' | 'savedConfig' | 'savedAt' | 'expectedConfig' | 'pausedAt'>
   >
 ): Promise<boolean> {
   const ts = nowIso()
+
   if (!from) {
-    // First sighting of this Worker. INSERT ... ON CONFLICT DO NOTHING so two
-    // concurrent first-pauses cannot both insert.
+    // First sighting of this Worker. `onConflictDoNothing` so two concurrent
+    // first-pauses cannot both insert.
     const res = await db
-      .prepare(
-        `INSERT INTO cicd_state
-           (account_id, worker_name, worker_tag, phase, saved_config, saved_at, expected_config, revision, paused_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-         ON CONFLICT(account_id, worker_name) DO NOTHING`
-      )
-      .bind(
-        key.accountId,
-        key.workerName,
-        key.workerTag,
-        next.phase ?? 'active',
-        next.saved_config ?? null,
-        next.saved_at ?? null,
-        next.expected_config ?? null,
-        next.paused_at ?? null,
-        ts
-      )
-      .run()
-    return (res.meta.changes ?? 0) > 0
+      .insert(cicdState)
+      .values({
+        accountId: key.accountId,
+        workerName: key.workerName,
+        workerTag: key.workerTag,
+        phase: next.phase ?? 'active',
+        savedConfig: next.savedConfig ?? null,
+        savedAt: next.savedAt ?? null,
+        expectedConfig: next.expectedConfig ?? null,
+        revision: 1,
+        pausedAt: next.pausedAt ?? null,
+        updatedAt: ts
+      })
+      .onConflictDoNothing({ target: [cicdState.accountId, cicdState.workerName] })
+    return (res.meta?.changes ?? 0) > 0
   }
 
-  // COALESCE(?, col): a field the caller did not supply keeps its stored value.
-  // In particular saved_config is only ever written when it is currently NULL,
-  // so a second pause can never overwrite the original (pre-pause) snapshot.
   const res = await db
-    .prepare(
-      `UPDATE cicd_state
-          SET phase = ?,
-              worker_tag = ?,
-              saved_config = CASE WHEN saved_config IS NULL THEN ? ELSE saved_config END,
-              saved_at     = CASE WHEN saved_config IS NULL THEN ? ELSE saved_at END,
-              expected_config = COALESCE(?, expected_config),
-              paused_at = ?,
-              revision = revision + 1,
-              updated_at = ?
-        WHERE account_id = ? AND worker_name = ? AND revision = ?`
+    .update(cicdState)
+    .set({
+      phase: next.phase ?? 'active',
+      workerTag: key.workerTag,
+      // Written only while it is still NULL: a second pause must never overwrite
+      // the original pre-pause snapshot, or "resume" would restore a pause.
+      savedConfig: sql`CASE WHEN ${cicdState.savedConfig} IS NULL THEN ${next.savedConfig ?? null} ELSE ${cicdState.savedConfig} END`,
+      savedAt: sql`CASE WHEN ${cicdState.savedConfig} IS NULL THEN ${next.savedAt ?? null} ELSE ${cicdState.savedAt} END`,
+      expectedConfig: sql`COALESCE(${next.expectedConfig ?? null}, ${cicdState.expectedConfig})`,
+      pausedAt: next.pausedAt ?? null,
+      revision: sql`${cicdState.revision} + 1`,
+      updatedAt: ts
+    })
+    .where(
+      and(
+        eq(cicdState.accountId, key.accountId),
+        eq(cicdState.workerName, key.workerName),
+        eq(cicdState.revision, from.revision)
+      )
     )
-    .bind(
-      next.phase ?? 'active',
-      key.workerTag,
-      next.saved_config ?? null,
-      next.saved_at ?? null,
-      next.expected_config ?? null,
-      next.paused_at ?? null,
-      ts,
-      key.accountId,
-      key.workerName,
-      from.revision
-    )
-    .run()
-  return (res.meta.changes ?? 0) > 0
+  return (res.meta?.changes ?? 0) > 0
 }
 
 /** Clear the saved snapshot once a restore has been verified against the remote. */
 export async function clearSavedConfig(
-  db: D1Database,
+  db: Db,
   accountId: string,
   workerName: string
 ): Promise<void> {
   await db
-    .prepare(
-      `UPDATE cicd_state
-          SET saved_config = NULL, saved_at = NULL, expected_config = NULL,
-              paused_at = NULL, phase = 'active', revision = revision + 1, updated_at = ?
-        WHERE account_id = ? AND worker_name = ?`
-    )
-    .bind(nowIso(), accountId, workerName)
-    .run()
+    .update(cicdState)
+    .set({
+      savedConfig: null,
+      savedAt: null,
+      expectedConfig: null,
+      pausedAt: null,
+      phase: 'active',
+      revision: sql`${cicdState.revision} + 1`,
+      updatedAt: nowIso()
+    })
+    .where(and(eq(cicdState.accountId, accountId), eq(cicdState.workerName, workerName)))
 }
 
+/**
+ * Who still holds this Worker paused?
+ *
+ * Served by the PARTIAL index `idx_leases_active (account_id, worker_name)
+ * WHERE released_at IS NULL`: released leases are not in the index at all, so
+ * this reads only live leases however long the history grows.
+ */
 export async function listActiveLeases(
-  db: D1Database,
+  db: Db,
   accountId: string,
   workerName: string
 ): Promise<LeaseRow[]> {
-  const { results } = await db
-    .prepare(
-      `SELECT * FROM cicd_leases
-        WHERE account_id = ? AND worker_name = ? AND released_at IS NULL
-        ORDER BY acquired_at ASC`
+  return await db
+    .select()
+    .from(cicdLeases)
+    .where(
+      and(
+        eq(cicdLeases.accountId, accountId),
+        eq(cicdLeases.workerName, workerName),
+        isNull(cicdLeases.releasedAt)
+      )
     )
-    .bind(accountId, workerName)
-    .all<LeaseRow>()
-  return results ?? []
+    .orderBy(cicdLeases.acquiredAt)
 }
 
 /**
@@ -167,7 +155,7 @@ export async function listActiveLeases(
  * authorization check, and nothing here trusts it.
  */
 export async function acquireLease(
-  db: D1Database,
+  db: Db,
   lease: {
     leaseId: string
     accountId: string
@@ -180,127 +168,130 @@ export async function acquireLease(
   }
 ): Promise<{ lease: LeaseRow; created: boolean }> {
   if (lease.idempotencyKey) {
+    // Unique partial index on (account_id, worker_name, idempotency_key).
     const existing = await db
-      .prepare(
-        'SELECT * FROM cicd_leases WHERE account_id = ? AND worker_name = ? AND idempotency_key = ?'
+      .select()
+      .from(cicdLeases)
+      .where(
+        and(
+          eq(cicdLeases.accountId, lease.accountId),
+          eq(cicdLeases.workerName, lease.workerName),
+          eq(cicdLeases.idempotencyKey, lease.idempotencyKey)
+        )
       )
-      .bind(lease.accountId, lease.workerName, lease.idempotencyKey)
-      .first<LeaseRow>()
-    if (existing) return { lease: existing, created: false }
+      .limit(1)
+    if (existing[0]) return { lease: existing[0], created: false }
   }
 
-  await db
-    .prepare(
-      `INSERT INTO cicd_leases
-         (lease_id, account_id, worker_name, worker_tag, owner, reason, idempotency_key, acquired_at, expires_at, released_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
-    )
-    .bind(
-      lease.leaseId,
-      lease.accountId,
-      lease.workerName,
-      lease.workerTag,
-      lease.owner,
-      lease.reason ?? null,
-      lease.idempotencyKey ?? null,
-      nowIso(),
-      lease.expiresAt ?? null
-    )
-    .run()
-
-  const row = await db
-    .prepare('SELECT * FROM cicd_leases WHERE lease_id = ?')
-    .bind(lease.leaseId)
-    .first<LeaseRow>()
-  return { lease: row as LeaseRow, created: true }
+  const row: LeaseRow = {
+    leaseId: lease.leaseId,
+    accountId: lease.accountId,
+    workerName: lease.workerName,
+    workerTag: lease.workerTag,
+    owner: lease.owner,
+    reason: lease.reason ?? null,
+    idempotencyKey: lease.idempotencyKey ?? null,
+    acquiredAt: nowIso(),
+    expiresAt: lease.expiresAt ?? null,
+    releasedAt: null
+  }
+  // `returning()` avoids a second SELECT for a row we just wrote.
+  const inserted = await db.insert(cicdLeases).values(row).returning()
+  return { lease: inserted[0] ?? row, created: true }
 }
 
 /** Release one lease. Idempotent: releasing an already-released lease is a no-op. */
 export async function releaseLease(
-  db: D1Database,
+  db: Db,
   accountId: string,
   workerName: string,
   leaseId: string
 ): Promise<boolean> {
   const res = await db
-    .prepare(
-      `UPDATE cicd_leases SET released_at = ?
-        WHERE lease_id = ? AND account_id = ? AND worker_name = ? AND released_at IS NULL`
+    .update(cicdLeases)
+    .set({ releasedAt: nowIso() })
+    .where(
+      and(
+        eq(cicdLeases.leaseId, leaseId),
+        eq(cicdLeases.accountId, accountId),
+        eq(cicdLeases.workerName, workerName),
+        isNull(cicdLeases.releasedAt)
+      )
     )
-    .bind(nowIso(), leaseId, accountId, workerName)
-    .run()
-  return (res.meta.changes ?? 0) > 0
+  return (res.meta?.changes ?? 0) > 0
 }
 
 /** Release every outstanding lease. Only reachable through an explicit force-resume. */
 export async function releaseAllLeases(
-  db: D1Database,
+  db: Db,
   accountId: string,
   workerName: string
 ): Promise<number> {
   const res = await db
-    .prepare(
-      `UPDATE cicd_leases SET released_at = ?
-        WHERE account_id = ? AND worker_name = ? AND released_at IS NULL`
+    .update(cicdLeases)
+    .set({ releasedAt: nowIso() })
+    .where(
+      and(
+        eq(cicdLeases.accountId, accountId),
+        eq(cicdLeases.workerName, workerName),
+        isNull(cicdLeases.releasedAt)
+      )
     )
-    .bind(nowIso(), accountId, workerName)
-    .run()
-  return res.meta.changes ?? 0
+  return res.meta?.changes ?? 0
 }
 
 /**
  * Expiry is REPORTING ONLY.
  *
  * An expired lease is surfaced as expired so a human or a force-resume can act
- * on it, but time passing never resumes a Worker on its own — an agent that is
- * still mid-refactor when its lease clock runs out must not have CI switched
- * back on underneath it.
+ * on it, but time passing never resumes a Worker — an agent that is still
+ * mid-refactor when its lease clock runs out must not have CI switched back on
+ * underneath it.
  */
 export function isExpired(lease: LeaseRow, now = Date.now()): boolean {
-  return Boolean(lease.expires_at && Date.parse(lease.expires_at) < now)
+  return Boolean(lease.expiresAt && Date.parse(lease.expiresAt) < now)
 }
 
 export async function audit(
-  db: D1Database,
-  entry: {
-    accountId: string
-    workerName: string
-    action: string
-    actor?: string
-    detail?: unknown
-  }
+  db: Db,
+  entry: { accountId: string; workerName: string; action: string; actor?: string; detail?: unknown }
 ): Promise<void> {
-  await db
-    .prepare(
-      'INSERT INTO cicd_audit (account_id, worker_name, action, actor, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-    )
-    .bind(
-      entry.accountId,
-      entry.workerName,
-      entry.action,
-      entry.actor ?? null,
-      entry.detail === undefined ? null : JSON.stringify(entry.detail),
-      nowIso()
-    )
-    .run()
+  await db.insert(cicdAudit).values({
+    accountId: entry.accountId,
+    workerName: entry.workerName,
+    action: entry.action,
+    actor: entry.actor ?? null,
+    detail: entry.detail === undefined ? null : JSON.stringify(entry.detail),
+    createdAt: nowIso()
+  })
 }
 
+/**
+ * Newest-first audit for one Worker.
+ *
+ * `idx_audit_worker (account_id, worker_name, id DESC)` carries the ordering, so
+ * D1 walks the first `limit` index entries instead of reading the Worker's whole
+ * history into a sort.
+ */
 export async function recentAudit(
-  db: D1Database,
+  db: Db,
   accountId: string,
   workerName: string,
   limit = 20
 ): Promise<Array<Record<string, unknown>>> {
-  const { results } = await db
-    .prepare(
-      'SELECT action, actor, detail, created_at FROM cicd_audit WHERE account_id = ? AND worker_name = ? ORDER BY id DESC LIMIT ?'
-    )
-    .bind(accountId, workerName, Math.min(limit, 100))
-    .all<Record<string, unknown>>()
-  return (results ?? []).map((r) => ({
-    ...r,
-    detail: typeof r.detail === 'string' ? safeParse(r.detail) : r.detail
-  }))
+  const rows = await db
+    .select({
+      action: cicdAudit.action,
+      actor: cicdAudit.actor,
+      detail: cicdAudit.detail,
+      created_at: cicdAudit.createdAt
+    })
+    .from(cicdAudit)
+    .where(and(eq(cicdAudit.accountId, accountId), eq(cicdAudit.workerName, workerName)))
+    .orderBy(desc(cicdAudit.id))
+    .limit(Math.min(limit, 100))
+
+  return rows.map((r) => ({ ...r, detail: r.detail ? safeParse(r.detail) : null }))
 }
 
 function safeParse(s: string): unknown {

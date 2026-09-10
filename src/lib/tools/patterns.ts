@@ -7,13 +7,18 @@
  * never a credential.
  */
 
+import { and, desc, eq, isNull, like, or, sql, type SQL } from 'drizzle-orm'
+import { buildPatternEvents, buildPatterns } from '../../db/schema'
 import { assembleLogs } from '../builds-query'
 import {
+  DUPLICATE_SCAN_LIMIT,
   findLikelyDuplicates,
   loadApplicablePatterns,
   matchPatterns,
   parseJsonArray,
+  patternHistory,
   recordPatternEvent,
+  scopeKeyFor,
   validateExpression,
   type PatternRow
 } from '../patterns'
@@ -35,33 +40,34 @@ const CONTRIBUTION_INSTRUCTION =
 
 function present(p: PatternRow) {
   return {
-    pattern_id: p.pattern_id,
+    pattern_id: p.patternId,
     title: p.title,
     explanation: p.explanation,
-    match_method: p.match_method,
-    match_expression: p.match_expression,
-    case_sensitive: p.case_sensitive === 1,
-    scope: { type: p.scope_type, value: p.scope_value },
+    match_method: p.matchMethod,
+    match_expression: p.matchExpression,
+    case_sensitive: p.caseSensitive === 1,
+    scope: { type: p.scopeType, value: p.scopeValue },
     severity: p.severity,
-    root_cause: p.root_cause,
-    resolution_steps: parseJsonArray(p.resolution_steps),
-    lessons_learned: p.lessons_learned,
-    verification_steps: parseJsonArray(p.verification_steps),
-    supporting_build_ids: parseJsonArray(p.supporting_build_ids),
-    doc_urls: parseJsonArray(p.doc_urls),
-    version_constraints: p.version_constraints,
+    root_cause: p.rootCause,
+    resolution_steps: parseJsonArray(p.resolutionSteps),
+    lessons_learned: p.lessonsLearned,
+    verification_steps: parseJsonArray(p.verificationSteps),
+    supporting_build_ids: parseJsonArray(p.supportingBuildIds),
+    doc_urls: parseJsonArray(p.docUrls),
+    version_constraints: p.versionConstraints,
     confidence: p.confidence,
     status: p.status,
-    superseded_by: p.superseded_by,
-    created_by: p.created_by,
-    created_at: p.created_at,
-    updated_at: p.updated_at,
-    last_verified_at: p.last_verified_at,
-    occurrence_count: p.occurrence_count,
-    successful_fixes: p.success_count,
-    unsuccessful_fixes: p.failure_count,
+    superseded_by: p.supersededBy,
+    created_by: p.createdBy,
+    created_at: p.createdAt,
+    updated_at: p.updatedAt,
+    last_verified_at: p.lastVerifiedAt,
+    occurrence_count: p.occurrenceCount,
+    last_matched_at: p.lastMatchedAt,
+    successful_fixes: p.successCount,
+    unsuccessful_fixes: p.failureCount,
     revision: p.revision,
-    deleted: Boolean(p.deleted_at)
+    deleted: Boolean(p.deletedAt)
   }
 }
 
@@ -70,14 +76,13 @@ async function loadPattern(
   id: string,
   includeDeleted = false
 ): Promise<PatternRow> {
-  const row = await ctx.db
-    .prepare(
-      `SELECT * FROM build_patterns WHERE pattern_id = ?${includeDeleted ? '' : ' AND deleted_at IS NULL'}`
-    )
-    .bind(id)
-    .first<PatternRow>()
-  if (!row) throw new ToolError('pattern_not_found', `No pattern "${id}".`)
-  return row
+  // Primary-key lookup: one row read.
+  const where = includeDeleted
+    ? eq(buildPatterns.patternId, id)
+    : and(eq(buildPatterns.patternId, id), isNull(buildPatterns.deletedAt))
+  const rows = await ctx.db.select().from(buildPatterns).where(where).limit(1)
+  if (!rows[0]) throw new ToolError('pattern_not_found', `No pattern "${id}".`)
+  return rows[0]
 }
 
 const SCOPES = ['global', 'account', 'worker', 'repository', 'framework', 'tool']
@@ -142,7 +147,7 @@ const patternsCreate: ToolDefinition = {
       )
     }
 
-    const duplicates = await findLikelyDuplicates(ctx.db, { title, match_expression: expression })
+    const duplicates = await findLikelyDuplicates(ctx.db, { title, matchExpression: expression })
     if (duplicates.length && !optBool(args, 'allow_duplicate')) {
       return {
         created: false,
@@ -162,39 +167,32 @@ const patternsCreate: ToolDefinition = {
     if (!SEVERITIES.includes(severity))
       throw new ToolError('invalid_argument', `severity must be one of ${SEVERITIES.join(', ')}.`)
 
-    await ctx.db
-      .prepare(
-        `INSERT INTO build_patterns
-           (pattern_id, title, explanation, match_method, match_expression, case_sensitive, scope_type, scope_value,
-            severity, root_cause, resolution_steps, lessons_learned, verification_steps, supporting_build_ids,
-            doc_urls, version_constraints, confidence, status, created_by, created_at, updated_at,
-            last_verified_at, occurrence_count, success_count, failure_count, revision)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, 0, 1)`
-      )
-      .bind(
-        id,
-        title,
-        optString(args, 'explanation') ?? null,
-        method,
-        expression,
-        optBool(args, 'case_sensitive') ? 1 : 0,
-        scopeType,
-        optString(args, 'scope_value') ?? null,
-        severity,
-        optString(args, 'root_cause') ?? null,
-        JSON.stringify(optStringArray(args, 'resolution_steps') ?? []),
-        optString(args, 'lessons_learned') ?? null,
-        JSON.stringify(optStringArray(args, 'verification_steps') ?? []),
-        JSON.stringify(supporting),
-        JSON.stringify(optStringArray(args, 'doc_urls') ?? []),
-        optString(args, 'version_constraints') ?? null,
-        Math.max(0, Math.min(optNumber(args, 'confidence') ?? 0.5, 1)),
-        status,
-        optString(args, 'created_by') ?? ctx.actor,
-        now,
-        now
-      )
-      .run()
+    await ctx.db.insert(buildPatterns).values({
+      patternId: id,
+      title,
+      explanation: optString(args, 'explanation') ?? null,
+      matchMethod: method,
+      matchExpression: expression,
+      caseSensitive: optBool(args, 'case_sensitive') ? 1 : 0,
+      scopeType,
+      scopeValue: optString(args, 'scope_value') ?? null,
+      // The indexed selector the hot read filters on. Everything else about
+      // scope is descriptive; this is the one column an index can use.
+      scopeKey: scopeKeyFor(scopeType, optString(args, 'scope_value')),
+      severity,
+      rootCause: optString(args, 'root_cause') ?? null,
+      resolutionSteps: JSON.stringify(optStringArray(args, 'resolution_steps') ?? []),
+      lessonsLearned: optString(args, 'lessons_learned') ?? null,
+      verificationSteps: JSON.stringify(optStringArray(args, 'verification_steps') ?? []),
+      supportingBuildIds: JSON.stringify(supporting),
+      docUrls: JSON.stringify(optStringArray(args, 'doc_urls') ?? []),
+      versionConstraints: optString(args, 'version_constraints') ?? null,
+      confidence: Math.max(0, Math.min(optNumber(args, 'confidence') ?? 0.5, 1)),
+      status,
+      createdBy: optString(args, 'created_by') ?? ctx.actor,
+      createdAt: now,
+      updatedAt: now
+    })
 
     await recordPatternEvent(ctx.db, {
       patternId: id,
@@ -228,14 +226,7 @@ const patternsGet: ToolDefinition = {
     const row = await loadPattern(ctx, requireString(args, 'pattern_id'), true)
     const history =
       (optBool(args, 'include_history') ?? true)
-        ? (
-            await ctx.db
-              .prepare(
-                'SELECT event, build_uuid, actor, notes, evidence, created_at FROM build_pattern_events WHERE pattern_id = ? ORDER BY id DESC LIMIT 50'
-              )
-              .bind(row.pattern_id)
-              .all<Record<string, unknown>>()
-          ).results
+        ? await patternHistory(ctx.db, row.patternId)
         : undefined
     return { pattern: present(row), history }
   }
@@ -263,49 +254,66 @@ const patternsList: ToolDefinition = {
     []
   ),
   async handler(args, ctx) {
-    const where: string[] = []
-    const binds: unknown[] = []
-    if (!optBool(args, 'include_deleted')) where.push('deleted_at IS NULL')
+    const where: SQL[] = []
+    if (!optBool(args, 'include_deleted')) where.push(isNull(buildPatterns.deletedAt))
     for (const [col, key] of [
-      ['scope_type', 'scope_type'],
-      ['scope_value', 'scope_value'],
-      ['severity', 'severity'],
-      ['status', 'status']
+      [buildPatterns.scopeType, 'scope_type'],
+      [buildPatterns.scopeValue, 'scope_value'],
+      [buildPatterns.severity, 'severity'],
+      [buildPatterns.status, 'status']
     ] as const) {
       const v = optString(args, key)
-      if (v) {
-        where.push(`${col} = ?`)
-        binds.push(v)
-      }
+      if (v) where.push(eq(col, v))
     }
+
     const q = optString(args, 'query')
     if (q) {
+      // A leading-wildcard LIKE cannot use a B-tree index, so this branch is a
+      // scan by construction — hence the hard row cap below. The pattern library
+      // is an authored, bounded set (hundreds, not millions); if it ever grows
+      // enough for this to matter, the fix is FTS5, which trades write cost for
+      // read cost and should be measured before adopting.
+      const needle = `%${q}%`
       where.push(
-        '(title LIKE ? OR explanation LIKE ? OR root_cause LIKE ? OR match_expression LIKE ?)'
+        or(
+          like(buildPatterns.title, needle),
+          like(buildPatterns.explanation, needle),
+          like(buildPatterns.rootCause, needle),
+          like(buildPatterns.matchExpression, needle)
+        ) as SQL
       )
-      binds.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`)
     }
+
     const limit = Math.max(1, Math.min(optNumber(args, 'limit') ?? 25, 100))
     const offset = Math.max(0, optNumber(args, 'offset') ?? 0)
+    const predicate = where.length ? and(...where) : undefined
 
-    const sql = `SELECT * FROM build_patterns${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY severity, confidence DESC, updated_at DESC LIMIT ? OFFSET ?`
-    const { results } = await ctx.db
-      .prepare(sql)
-      .bind(...binds, limit, offset)
-      .all<PatternRow>()
-    const total = await ctx.db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM build_patterns${where.length ? ` WHERE ${where.join(' AND ')}` : ''}`
+    // ONE query, not two. A separate `SELECT COUNT(*)` would repeat the same
+    // scan and double the rows billed for a single listing; `COUNT(*) OVER ()`
+    // carries the total on each returned row instead.
+    const rows = await ctx.db
+      .select({ pattern: buildPatterns, total: sql<number>`COUNT(*) OVER ()`.as('total') })
+      .from(buildPatterns)
+      .where(predicate)
+      .orderBy(
+        buildPatterns.severity,
+        desc(buildPatterns.confidence),
+        desc(buildPatterns.updatedAt)
       )
-      .bind(...binds)
-      .first<{ n: number }>()
+      .limit(limit)
+      .offset(offset)
+
+    const total = rows[0]?.total ?? 0
+    const patterns = rows.map((r) => r.pattern)
 
     return {
-      patterns: (results ?? []).map(present),
-      returned: results?.length ?? 0,
-      total: total?.n ?? 0,
-      next_offset:
-        offset + (results?.length ?? 0) < (total?.n ?? 0) ? offset + (results?.length ?? 0) : null
+      patterns: patterns.map(present),
+      returned: patterns.length,
+      total,
+      scan_note: q
+        ? `Free-text search cannot use an index (leading wildcard), so this read scanned live patterns up to the cap. ${DUPLICATE_SCAN_LIMIT} is the same ceiling used for duplicate detection.`
+        : undefined,
+      next_offset: offset + patterns.length < total ? offset + patterns.length : null
     }
   }
 }
@@ -348,78 +356,94 @@ const patternsUpdate: ToolDefinition = {
     if (revision === undefined) throw new ToolError('invalid_argument', '"revision" is required.')
     const current = await loadPattern(ctx, id)
 
-    const sets: string[] = []
-    const binds: unknown[] = []
-    const push = (col: string, value: unknown) => {
-      sets.push(`${col} = ?`)
-      binds.push(value)
-    }
+    const set: Record<string, unknown> = {}
 
-    const method = (optString(args, 'match_method') ?? current.match_method) as
-      | 'substring'
-      | 'regex'
+    const method = (optString(args, 'match_method') ?? current.matchMethod) as 'substring' | 'regex'
     if ('match_expression' in args || 'match_method' in args) {
-      const expr = redactText(optString(args, 'match_expression') ?? current.match_expression)
+      const expr = redactText(optString(args, 'match_expression') ?? current.matchExpression)
       const valid = validateExpression(method, expr)
       if (!valid.ok) throw new ToolError('unsafe_expression', valid.reason)
-      push('match_expression', expr)
-      push('match_method', method)
+      set.matchExpression = expr
+      set.matchMethod = method
     }
-    for (const key of [
-      'title',
-      'explanation',
-      'scope_type',
-      'scope_value',
-      'severity',
-      'root_cause',
-      'lessons_learned',
-      'version_constraints',
-      'superseded_by'
-    ] as const) {
-      const v = optString(args, key)
-      if (v !== undefined) push(key, v)
+
+    const textFields = [
+      ['title', 'title'],
+      ['explanation', 'explanation'],
+      ['scope_type', 'scopeType'],
+      ['scope_value', 'scopeValue'],
+      ['severity', 'severity'],
+      ['root_cause', 'rootCause'],
+      ['lessons_learned', 'lessonsLearned'],
+      ['version_constraints', 'versionConstraints'],
+      ['superseded_by', 'supersededBy']
+    ] as const
+    for (const [arg, col] of textFields) {
+      const v = optString(args, arg)
+      if (v !== undefined) set[col] = v
     }
-    for (const key of [
-      'resolution_steps',
-      'verification_steps',
-      'supporting_build_ids',
-      'doc_urls'
-    ] as const) {
-      const v = optStringArray(args, key)
-      if (v) push(key, JSON.stringify(v))
+    // scope_key is derived, never supplied: it must stay consistent with the
+    // scope fields or the indexed hot read would silently stop finding this row.
+    if ('scope_type' in args || 'scope_value' in args) {
+      set.scopeKey = scopeKeyFor(
+        (set.scopeType as string) ?? current.scopeType,
+        (set.scopeValue as string) ?? current.scopeValue
+      )
     }
-    if ('case_sensitive' in args) push('case_sensitive', optBool(args, 'case_sensitive') ? 1 : 0)
+
+    const jsonFields = [
+      ['resolution_steps', 'resolutionSteps'],
+      ['verification_steps', 'verificationSteps'],
+      ['supporting_build_ids', 'supportingBuildIds'],
+      ['doc_urls', 'docUrls']
+    ] as const
+    for (const [arg, col] of jsonFields) {
+      const v = optStringArray(args, arg)
+      if (v) set[col] = JSON.stringify(v)
+    }
+
+    if ('case_sensitive' in args) set.caseSensitive = optBool(args, 'case_sensitive') ? 1 : 0
     const confidence = optNumber(args, 'confidence')
-    if (confidence !== undefined) push('confidence', Math.max(0, Math.min(confidence, 1)))
+    if (confidence !== undefined) set.confidence = Math.max(0, Math.min(confidence, 1))
 
     const status = optString(args, 'status')
     if (status) {
-      if (!STATUSES.includes(status))
+      if (!STATUSES.includes(status)) {
         throw new ToolError('invalid_argument', `status must be one of ${STATUSES.join(', ')}.`)
+      }
       const supporting =
-        optStringArray(args, 'supporting_build_ids') ?? parseJsonArray(current.supporting_build_ids)
+        optStringArray(args, 'supporting_build_ids') ?? parseJsonArray(current.supportingBuildIds)
       if (status === 'verified' && !supporting.length) {
         throw new ToolError(
           'unverified',
           'A pattern cannot be marked "verified" without supporting build IDs. Record a successful resolution with build_patterns_record_outcome instead.'
         )
       }
-      push('status', status)
-      if (status === 'verified') push('last_verified_at', new Date().toISOString())
+      set.status = status
+      if (status === 'verified') set.lastVerifiedAt = new Date().toISOString()
     }
 
-    if (!sets.length)
+    if (!Object.keys(set).length) {
       return { updated: false, message: 'No fields to update.', pattern: present(current) }
+    }
 
-    push('updated_at', new Date().toISOString())
+    set.updatedAt = new Date().toISOString()
+    set.revision = sql`${buildPatterns.revision} + 1`
+
+    // The `revision = ?` predicate is the concurrency guard: a caller working
+    // from a stale read loses instead of clobbering a concurrent edit.
     const res = await ctx.db
-      .prepare(
-        `UPDATE build_patterns SET ${sets.join(', ')}, revision = revision + 1 WHERE pattern_id = ? AND revision = ? AND deleted_at IS NULL`
+      .update(buildPatterns)
+      .set(set)
+      .where(
+        and(
+          eq(buildPatterns.patternId, id),
+          eq(buildPatterns.revision, revision),
+          isNull(buildPatterns.deletedAt)
+        )
       )
-      .bind(...binds, id, revision)
-      .run()
 
-    if (!(res.meta.changes ?? 0)) {
+    if (!(res.meta?.changes ?? 0)) {
       throw new ToolError(
         'revision_conflict',
         `Pattern "${id}" is at revision ${current.revision}, not ${revision} — someone else changed it. Re-read it with build_patterns_get and retry.`,
@@ -430,7 +454,7 @@ const patternsUpdate: ToolDefinition = {
       patternId: id,
       event: 'updated',
       actor: ctx.actor,
-      notes: optString(args, 'notes') ?? `fields: ${sets.map((s) => s.split(' ')[0]).join(', ')}`
+      notes: optString(args, 'notes') ?? `fields: ${Object.keys(set).join(', ')}`
     })
     return { updated: true, pattern: present(await loadPattern(ctx, id)) }
   }
@@ -454,16 +478,17 @@ const patternsDelete: ToolDefinition = {
     const id = requireString(args, 'pattern_id')
     await loadPattern(ctx, id, true)
     if (optBool(args, 'hard')) {
-      await ctx.db.prepare('DELETE FROM build_pattern_events WHERE pattern_id = ?').bind(id).run()
-      await ctx.db.prepare('DELETE FROM build_patterns WHERE pattern_id = ?').bind(id).run()
+      await ctx.db.delete(buildPatternEvents).where(eq(buildPatternEvents.patternId, id))
+      await ctx.db.delete(buildPatterns).where(eq(buildPatterns.patternId, id))
       return { deleted: true, mode: 'hard', pattern_id: id }
     }
+    // Soft delete. The partial indexes are `WHERE deleted_at IS NULL`, so this
+    // also REMOVES the row from both of them: it stops being read by the hot
+    // query and stops costing index writes.
     await ctx.db
-      .prepare(
-        'UPDATE build_patterns SET deleted_at = ?, revision = revision + 1 WHERE pattern_id = ?'
-      )
-      .bind(new Date().toISOString(), id)
-      .run()
+      .update(buildPatterns)
+      .set({ deletedAt: new Date().toISOString(), revision: sql`${buildPatterns.revision} + 1` })
+      .where(eq(buildPatterns.patternId, id))
     await recordPatternEvent(ctx.db, {
       patternId: id,
       event: 'deleted',
@@ -515,38 +540,43 @@ const patternsTest: ToolDefinition = {
 
     const candidate: PatternRow = patternId
       ? await loadPattern(ctx, patternId)
-      : ({
-          pattern_id: '(proposed)',
+      : {
+          patternId: '(proposed)',
           title: '(proposed)',
           explanation: null,
-          match_method: (optString(args, 'match_method') ?? 'substring') as 'substring' | 'regex',
-          match_expression: expression as string,
-          case_sensitive: optBool(args, 'case_sensitive') ? 1 : 0,
-          scope_type: 'global',
-          scope_value: null,
+          matchMethod: optString(args, 'match_method') ?? 'substring',
+          matchExpression: expression as string,
+          caseSensitive: optBool(args, 'case_sensitive') ? 1 : 0,
+          scopeType: 'global',
+          scopeValue: null,
+          scopeKey: '*',
           severity: 'medium',
-          root_cause: null,
-          resolution_steps: null,
-          lessons_learned: null,
-          verification_steps: null,
-          supporting_build_ids: null,
-          doc_urls: null,
-          version_constraints: null,
+          rootCause: null,
+          resolutionSteps: null,
+          lessonsLearned: null,
+          verificationSteps: null,
+          supportingBuildIds: null,
+          docUrls: null,
+          versionConstraints: null,
           confidence: 0.5,
           status: 'proposed',
-          superseded_by: null,
-          created_by: null,
-          created_at: '',
-          updated_at: '',
-          last_verified_at: null,
-          occurrence_count: 0,
-          success_count: 0,
-          failure_count: 0,
+          supersededBy: null,
+          createdBy: null,
+          createdAt: '',
+          updatedAt: '',
+          lastVerifiedAt: null,
+          occurrenceCount: 0,
+          lastMatchedAt: null,
+          successCount: 0,
+          failureCount: 0,
           revision: 0,
-          deleted_at: null
-        } satisfies PatternRow)
+          deletedAt: null
+        }
 
-    const valid = validateExpression(candidate.match_method, candidate.match_expression)
+    const valid = validateExpression(
+      candidate.matchMethod as 'substring' | 'regex',
+      candidate.matchExpression
+    )
     if (!valid.ok) throw new ToolError('unsafe_expression', valid.reason)
 
     const [match] = matchPatterns(text, [candidate], { maxEvidencePerPattern: 5 })
@@ -600,35 +630,24 @@ const patternsRecordOutcome: ToolDefinition = {
       )
     }
 
-    const supporting = parseJsonArray(pattern.supporting_build_ids)
+    const supporting = parseJsonArray(pattern.supportingBuildIds)
     if (buildUuid && !supporting.includes(buildUuid)) supporting.push(buildUuid)
 
     const now = new Date().toISOString()
     await ctx.db
-      .prepare(
-        `UPDATE build_patterns
-            SET success_count = success_count + ?,
-                failure_count = failure_count + ?,
-                supporting_build_ids = ?,
-                status = ?,
-                last_verified_at = ?,
-                confidence = ?,
-                updated_at = ?,
-                revision = revision + 1
-          WHERE pattern_id = ?`
-      )
-      .bind(
-        resolved ? 1 : 0,
-        resolved ? 0 : 1,
-        JSON.stringify(supporting),
-        markVerified ? 'verified' : pattern.status,
-        markVerified ? now : pattern.last_verified_at,
+      .update(buildPatterns)
+      .set({
+        successCount: sql`${buildPatterns.successCount} + ${resolved ? 1 : 0}`,
+        failureCount: sql`${buildPatterns.failureCount} + ${resolved ? 0 : 1}`,
+        supportingBuildIds: JSON.stringify(supporting),
+        status: markVerified ? 'verified' : pattern.status,
+        lastVerifiedAt: markVerified ? now : pattern.lastVerifiedAt,
         // Nudge confidence toward the observed outcome, bounded — never a jump to 1.
-        Math.max(0.05, Math.min(pattern.confidence + (resolved ? 0.1 : -0.15), 0.95)),
-        now,
-        id
-      )
-      .run()
+        confidence: Math.max(0.05, Math.min(pattern.confidence + (resolved ? 0.1 : -0.15), 0.95)),
+        updatedAt: now,
+        revision: sql`${buildPatterns.revision} + 1`
+      })
+      .where(eq(buildPatterns.patternId, id))
 
     await recordPatternEvent(ctx.db, {
       patternId: id,

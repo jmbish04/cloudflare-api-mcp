@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import schemaSqlText from '../migrations/0000_init.sql?raw'
 import {
   buildMatcher,
   matchPatterns,
@@ -8,34 +9,36 @@ import {
   type PatternRow
 } from '../src/lib/patterns'
 
-const pattern = (over: Partial<PatternRow> & { pattern_id: string }): PatternRow => ({
+const pattern = (over: Partial<PatternRow> & { patternId: string }): PatternRow => ({
   title: 'Startup CPU limit',
   explanation: null,
-  match_method: 'substring',
-  match_expression: 'Script startup exceeded CPU time limit',
-  case_sensitive: 0,
-  scope_type: 'global',
-  scope_value: null,
+  matchMethod: 'substring',
+  matchExpression: 'Script startup exceeded CPU time limit',
+  caseSensitive: 0,
+  scopeType: 'global',
+  scopeValue: null,
+  scopeKey: '*',
   severity: 'high',
-  root_cause: 'Too much module-scope work',
-  resolution_steps: JSON.stringify(['Defer with dynamic import()']),
-  lessons_learned: null,
-  verification_steps: JSON.stringify(['wrangler check startup']),
-  supporting_build_ids: JSON.stringify(['b1']),
-  doc_urls: JSON.stringify(['https://developers.cloudflare.com/workers/platform/limits/']),
-  version_constraints: null,
+  rootCause: 'Too much module-scope work',
+  resolutionSteps: JSON.stringify(['Defer with dynamic import()']),
+  lessonsLearned: null,
+  verificationSteps: JSON.stringify(['wrangler check startup']),
+  supportingBuildIds: JSON.stringify(['b1']),
+  docUrls: JSON.stringify(['https://developers.cloudflare.com/workers/platform/limits/']),
+  versionConstraints: null,
   confidence: 0.8,
   status: 'verified',
-  superseded_by: null,
-  created_by: 'test',
-  created_at: '2026-01-01T00:00:00Z',
-  updated_at: '2026-01-01T00:00:00Z',
-  last_verified_at: null,
-  occurrence_count: 0,
-  success_count: 0,
-  failure_count: 0,
+  supersededBy: null,
+  createdBy: 'test',
+  createdAt: '2026-01-01T00:00:00Z',
+  updatedAt: '2026-01-01T00:00:00Z',
+  lastVerifiedAt: null,
+  occurrenceCount: 0,
+  lastMatchedAt: null,
+  successCount: 0,
+  failureCount: 0,
   revision: 1,
-  deleted_at: null,
+  deletedAt: null,
   ...over
 })
 
@@ -86,7 +89,7 @@ describe('matchPatterns', () => {
   ].join('\n')
 
   it('returns evidence and an explicit caveat, never a claim of proof', () => {
-    const [m] = matchPatterns(log, [pattern({ pattern_id: 'p1' })])
+    const [m] = matchPatterns(log, [pattern({ patternId: 'p1' })])
     expect(m.pattern_id).toBe('p1')
     expect(m.evidence[0]).toContain('10021')
     expect(m.matchedLineNumbers).toEqual([2])
@@ -95,19 +98,19 @@ describe('matchPatterns', () => {
   })
 
   it('returns nothing when the signature is absent', () => {
-    expect(matchPatterns('all fine', [pattern({ pattern_id: 'p1' })])).toHaveLength(0)
+    expect(matchPatterns('all fine', [pattern({ patternId: 'p1' })])).toHaveLength(0)
   })
 
   it('is deterministic: severity, then confidence, then id', () => {
     const patterns = [
-      pattern({ pattern_id: 'z', severity: 'medium', confidence: 0.9, match_expression: 'Build' }),
+      pattern({ patternId: 'z', severity: 'medium', confidence: 0.9, matchExpression: 'Build' }),
       pattern({
-        pattern_id: 'a',
+        patternId: 'a',
         severity: 'critical',
         confidence: 0.1,
-        match_expression: 'Build'
+        matchExpression: 'Build'
       }),
-      pattern({ pattern_id: 'm', severity: 'medium', confidence: 0.95, match_expression: 'Build' })
+      pattern({ patternId: 'm', severity: 'medium', confidence: 0.95, matchExpression: 'Build' })
     ]
     const ids = matchPatterns(log, patterns).map((m) => m.pattern_id)
     expect(ids).toEqual(['a', 'm', 'z'])
@@ -115,12 +118,12 @@ describe('matchPatterns', () => {
   })
 
   it('skips a stored pattern whose expression is unsafe instead of running it', () => {
-    const bad = pattern({ pattern_id: 'bad', match_method: 'regex', match_expression: '(a+)+' })
+    const bad = pattern({ patternId: 'bad', matchMethod: 'regex', matchExpression: '(a+)+' })
     expect(matchPatterns('aaaaaaaaaaaaaaaaaaaaaaaa!', [bad])).toHaveLength(0)
   })
 
   it('redacts credentials that appear in the matched evidence', () => {
-    const p = pattern({ pattern_id: 'p', match_expression: 'auth failed' })
+    const p = pattern({ patternId: 'p', matchExpression: 'auth failed' })
     const withSecret = 'auth failed for ghp_abcdefghijklmnopqrstuvwxyz0123456789'
     expect(matchPatterns(withSecret, [p])[0].evidence[0]).not.toContain('ghp_abcdefghijklmnop')
   })
@@ -147,5 +150,32 @@ describe('extractDocUrls', () => {
     expect(extractDocUrls(text)).toEqual([
       'https://developers.cloudflare.com/workers/ci-cd/builds/'
     ])
+  })
+})
+
+describe('billing shape of the pattern hot path', () => {
+  it('never indexes the columns a log match writes', () => {
+    // D1 charges 1000x more per WRITTEN row than per read row, and an index adds
+    // a second written row whenever a write touches an indexed column. A log
+    // match writes occurrence_count and last_matched_at, so if either ever ends
+    // up in an index, every match silently doubles in cost.
+    // Asserted on the generated migration SQL — that is what actually reaches D1.
+    const indexLines = schemaSqlText
+      .split('\n')
+      .filter((l) => l.startsWith('CREATE INDEX') || l.startsWith('CREATE UNIQUE INDEX'))
+    const patternIndexes = indexLines.filter((l) => l.includes('`build_patterns`'))
+    expect(patternIndexes.length).toBeGreaterThan(0)
+    for (const line of patternIndexes) {
+      expect(line).not.toContain('occurrence_count')
+      expect(line).not.toContain('last_matched_at')
+    }
+  })
+
+  it('keeps every build_patterns index partial on live rows', () => {
+    // `WHERE deleted_at IS NULL` keeps soft-deleted patterns out of the index, so
+    // they are neither scanned by the hot read nor index-written when deleted.
+    for (const line of schemaSqlText.split('\n').filter((l) => l.includes('ON `build_patterns`'))) {
+      expect(line).toContain('WHERE deleted_at IS NULL')
+    }
   })
 })

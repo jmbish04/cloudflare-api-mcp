@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:test'
 import { beforeEach, describe, expect, it } from 'vitest'
-import schemaSql from '../migrations/0001_cicd_and_patterns.sql?raw'
+import schemaSql from '../migrations/0000_init.sql?raw'
+import { getDb } from '../src/db/client'
 import {
   acquireLease,
   audit,
@@ -14,7 +15,8 @@ import {
   transition
 } from '../src/lib/cicd-state'
 
-const db = (env as unknown as { CICD_DB: D1Database }).CICD_DB
+const raw = (env as unknown as { CICD_DB: D1Database }).CICD_DB
+const db = getDb(raw)
 const KEY = { accountId: 'acct1', workerName: 'my-worker', workerTag: 'tag-aaa' }
 
 beforeEach(async () => {
@@ -25,10 +27,12 @@ beforeEach(async () => {
     'build_patterns',
     'build_pattern_events'
   ]) {
-    await db.prepare(`DROP TABLE IF EXISTS ${table}`).run()
+    await raw.prepare(`DROP TABLE IF EXISTS ${table}`).run()
   }
   // Strip comments BEFORE splitting: a `--` comment in this file contains a
   // semicolon, and splitting first would cut a CREATE TABLE in half.
+  // drizzle-kit separates statements with `--> statement-breakpoint`; comments in
+  // the file can contain semicolons, so strip them before splitting.
   const statements = schemaSql
     .split('\n')
     .filter((line) => !line.trim().startsWith('--'))
@@ -37,7 +41,7 @@ beforeEach(async () => {
     .map((s) => s.trim())
     .filter(Boolean)
   for (const stmt of statements) {
-    await db.prepare(stmt).run()
+    await raw.prepare(stmt).run()
   }
 })
 
@@ -57,14 +61,14 @@ describe('pause leases', () => {
     const first = await lease('agent-a', { idempotencyKey: 'run-1' })
     const again = await lease('agent-a', { idempotencyKey: 'run-1' })
     expect(again.created).toBe(false)
-    expect(again.lease.lease_id).toBe(first.lease.lease_id)
+    expect(again.lease.leaseId).toBe(first.lease.leaseId)
     expect(await listActiveLeases(db, KEY.accountId, KEY.workerName)).toHaveLength(1)
   })
 
   it("releasing one agent's lease leaves the other's pause standing", async () => {
     const a = await lease('agent-a')
     await lease('agent-b')
-    expect(await releaseLease(db, KEY.accountId, KEY.workerName, a.lease.lease_id)).toBe(true)
+    expect(await releaseLease(db, KEY.accountId, KEY.workerName, a.lease.leaseId)).toBe(true)
     const remaining = await listActiveLeases(db, KEY.accountId, KEY.workerName)
     expect(remaining).toHaveLength(1)
     expect(remaining[0].owner).toBe('agent-b')
@@ -73,15 +77,15 @@ describe('pause leases', () => {
   it('releasing the last lease empties the holder list, which is what permits a restore', async () => {
     const a = await lease('agent-a')
     const b = await lease('agent-b')
-    await releaseLease(db, KEY.accountId, KEY.workerName, a.lease.lease_id)
-    await releaseLease(db, KEY.accountId, KEY.workerName, b.lease.lease_id)
+    await releaseLease(db, KEY.accountId, KEY.workerName, a.lease.leaseId)
+    await releaseLease(db, KEY.accountId, KEY.workerName, b.lease.leaseId)
     expect(await listActiveLeases(db, KEY.accountId, KEY.workerName)).toHaveLength(0)
   })
 
   it('release is idempotent and does not resurrect a released lease', async () => {
     const a = await lease('agent-a')
-    expect(await releaseLease(db, KEY.accountId, KEY.workerName, a.lease.lease_id)).toBe(true)
-    expect(await releaseLease(db, KEY.accountId, KEY.workerName, a.lease.lease_id)).toBe(false)
+    expect(await releaseLease(db, KEY.accountId, KEY.workerName, a.lease.leaseId)).toBe(true)
+    expect(await releaseLease(db, KEY.accountId, KEY.workerName, a.lease.leaseId)).toBe(false)
   })
 
   it('force release clears every outstanding lease', async () => {
@@ -105,11 +109,11 @@ describe('pause state transitions', () => {
       { trigger_uuid: 't1', branch_includes: ['main'], branch_excludes: [] }
     ])
     expect(
-      await transition(db, KEY, null, { phase: 'paused', saved_config: original, saved_at: 'ts1' })
+      await transition(db, KEY, null, { phase: 'paused', savedConfig: original, savedAt: 'ts1' })
     ).toBe(true)
 
     let state = (await getState(db, KEY.accountId, KEY.workerName))!
-    expect(state.saved_config).toBe(original)
+    expect(state.savedConfig).toBe(original)
 
     // A SECOND pause arrives while already paused, carrying the PAUSED config.
     const alreadyPaused = JSON.stringify([
@@ -123,11 +127,11 @@ describe('pause state transitions', () => {
       db,
       KEY,
       { revision: state.revision },
-      { phase: 'paused', saved_config: alreadyPaused }
+      { phase: 'paused', savedConfig: alreadyPaused }
     )
 
     state = (await getState(db, KEY.accountId, KEY.workerName))!
-    expect(state.saved_config).toBe(original)
+    expect(state.savedConfig).toBe(original)
   })
 
   it('rejects a transition from a stale revision (concurrent callers)', async () => {
@@ -142,18 +146,18 @@ describe('pause state transitions', () => {
   })
 
   it('records an interrupted transition so it can be reconciled', async () => {
-    await transition(db, KEY, null, { phase: 'pausing', saved_config: '[]', saved_at: 'ts' })
+    await transition(db, KEY, null, { phase: 'pausing', savedConfig: '[]', savedAt: 'ts' })
     const state = (await getState(db, KEY.accountId, KEY.workerName))!
     // A crash between the D1 write and the Cloudflare call leaves exactly this.
     expect(state.phase).toBe('pausing')
-    expect(state.saved_config).toBe('[]')
+    expect(state.savedConfig).toBe('[]')
   })
 
   it('clears the saved config only when told to, and returns to active', async () => {
-    await transition(db, KEY, null, { phase: 'paused', saved_config: '[{"a":1}]', saved_at: 'ts' })
+    await transition(db, KEY, null, { phase: 'paused', savedConfig: '[{"a":1}]', savedAt: 'ts' })
     await clearSavedConfig(db, KEY.accountId, KEY.workerName)
     const state = (await getState(db, KEY.accountId, KEY.workerName))!
-    expect(state.saved_config).toBeNull()
+    expect(state.savedConfig).toBeNull()
     expect(state.phase).toBe('active')
   })
 })

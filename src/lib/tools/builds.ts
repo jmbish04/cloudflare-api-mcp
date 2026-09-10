@@ -26,7 +26,7 @@ import {
   buildMatcher,
   loadApplicablePatterns,
   matchPatterns,
-  recordPatternEvent,
+  recordMatches,
   validateExpression,
   type PatternMatch
 } from '../patterns'
@@ -176,25 +176,21 @@ async function fetchAndDiagnose(
   })
   const matches: PatternMatch[] = matchPatterns(redacted, patterns)
 
-  // Occurrence counts are the only pattern state a read updates: they are what
-  // makes "how often does this actually happen" answerable later.
-  for (const m of matches) {
-    await ctx.db
-      .prepare(
-        'UPDATE build_patterns SET occurrence_count = occurrence_count + 1 WHERE pattern_id = ?'
-      )
-      .bind(m.pattern_id)
-      .run()
-    // The match object was built from the row as it was BEFORE this increment;
-    // reporting that stale value makes a first-ever match read "occurrences: 0".
-    m.occurrence_count += 1
-    await recordPatternEvent(ctx.db, {
-      patternId: m.pattern_id,
-      event: 'matched',
-      buildUuid,
-      actor: ctx.actor,
-      evidence: m.evidence[0]
-    })
+  // Recording a match is the hot write path. `recordMatches` batches it into one
+  // round trip and touches only the two UNINDEXED counter columns, so a match
+  // costs exactly one written row — D1 charges 1000x more per written row than
+  // per read row. No per-match event row is written: it tripled that cost to
+  // record what the counters already say.
+  if (matches.length) {
+    const at = new Date().toISOString()
+    await recordMatches(
+      ctx.db,
+      matches.map((m) => m.pattern_id),
+      at
+    )
+    // The match objects were built from rows read BEFORE the increment;
+    // reporting those makes a first-ever match read "occurrences: 0".
+    for (const m of matches) m.occurrence_count += 1
   }
 
   const criticality = assessCriticality(

@@ -1,5 +1,5 @@
 /**
- * Reusable build-failure patterns: matching engine and D1 access.
+ * Reusable build-failure patterns: matching engine and D1 access (Drizzle).
  *
  * A pattern is a *diagnosis hypothesis*, never a proof. Matching text in a log
  * says the signature is present; it does not establish the root cause, and every
@@ -8,45 +8,26 @@
  *
  * Patterns hold a redacted signature, supporting build IDs and doc links. They
  * never hold build transcripts.
+ *
+ * ## Billing
+ *
+ * `loadApplicablePatterns` runs on every build-log retrieval — it is the hot
+ * read — and `recordMatches` is the hot write. Both are shaped for D1's
+ * rows-read / rows-written billing; see the comments on each.
  */
 
+import { and, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm'
+import type { Db } from '../db/client'
+import { buildPatternEvents, buildPatterns } from '../db/schema'
+import type { PatternRow } from '../db/schema'
 import { redactText } from './redact'
+
+export type { PatternRow }
 
 export type MatchMethod = 'substring' | 'regex'
 export type PatternStatus = 'proposed' | 'verified' | 'deprecated'
 export type ScopeType = 'global' | 'account' | 'worker' | 'repository' | 'framework' | 'tool'
 export type Severity = 'low' | 'medium' | 'high' | 'critical'
-
-export interface PatternRow {
-  pattern_id: string
-  title: string
-  explanation: string | null
-  match_method: MatchMethod
-  match_expression: string
-  case_sensitive: number
-  scope_type: ScopeType
-  scope_value: string | null
-  severity: Severity
-  root_cause: string | null
-  resolution_steps: string | null
-  lessons_learned: string | null
-  verification_steps: string | null
-  supporting_build_ids: string | null
-  doc_urls: string | null
-  version_constraints: string | null
-  confidence: number
-  status: PatternStatus
-  superseded_by: string | null
-  created_by: string | null
-  created_at: string
-  updated_at: string
-  last_verified_at: string | null
-  occurrence_count: number
-  success_count: number
-  failure_count: number
-  revision: number
-  deleted_at: string | null
-}
 
 // ---------------------------------------------------------------------------
 // Bounded matching
@@ -169,20 +150,24 @@ export function matchPatterns(
 ): PatternMatch[] {
   const maxEvidence = Math.max(1, Math.min(opts.maxEvidencePerPattern ?? 3, 10))
   const lines = logText.split('\n', MAX_LINES_SCANNED).map((l) => l.slice(0, MAX_LINE_LENGTH))
-  const severityRank: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3 }
+  const severityRank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 }
 
   const ordered = [...patterns]
     .sort(
       (a, b) =>
-        severityRank[a.severity] - severityRank[b.severity] ||
+        (severityRank[a.severity] ?? 9) - (severityRank[b.severity] ?? 9) ||
         b.confidence - a.confidence ||
-        a.pattern_id.localeCompare(b.pattern_id)
+        a.patternId.localeCompare(b.patternId)
     )
     .slice(0, MAX_PATTERNS_EVALUATED)
 
   const out: PatternMatch[] = []
   for (const p of ordered) {
-    const matcher = buildMatcher(p.match_method, p.match_expression, p.case_sensitive === 1)
+    const matcher = buildMatcher(
+      p.matchMethod as MatchMethod,
+      p.matchExpression,
+      p.caseSensitive === 1
+    )
     if (!matcher) continue // an unsafe/invalid stored expression is skipped, never run
 
     const evidence: string[] = []
@@ -196,23 +181,23 @@ export function matchPatterns(
     if (!evidence.length) continue
 
     out.push({
-      pattern_id: p.pattern_id,
+      pattern_id: p.patternId,
       title: p.title,
-      severity: p.severity,
-      status: p.status,
+      severity: p.severity as Severity,
+      status: p.status as PatternStatus,
       confidence: p.confidence,
       evidence,
       matchedLineNumbers,
-      root_cause: p.root_cause,
-      resolution_steps: parseJsonArray(p.resolution_steps),
-      verification_steps: parseJsonArray(p.verification_steps),
-      lessons_learned: p.lessons_learned,
-      version_constraints: p.version_constraints,
-      doc_urls: parseJsonArray(p.doc_urls),
-      occurrence_count: p.occurrence_count,
-      success_count: p.success_count,
-      failure_count: p.failure_count,
-      last_verified_at: p.last_verified_at,
+      root_cause: p.rootCause,
+      resolution_steps: parseJsonArray(p.resolutionSteps),
+      verification_steps: parseJsonArray(p.verificationSteps),
+      lessons_learned: p.lessonsLearned,
+      version_constraints: p.versionConstraints,
+      doc_urls: parseJsonArray(p.docUrls),
+      occurrence_count: p.occurrenceCount,
+      success_count: p.successCount,
+      failure_count: p.failureCount,
+      last_verified_at: p.lastVerifiedAt,
       caveat: MATCH_CAVEAT
     })
   }
@@ -223,34 +208,77 @@ export function matchPatterns(
 // Scope selection
 // ---------------------------------------------------------------------------
 
+/** The `scope_key` value a scoped pattern is stored under. `'*'` means global. */
+export const GLOBAL_SCOPE_KEY = '*'
+
+export function scopeKeyFor(scopeType: string, scopeValue: string | null | undefined): string {
+  return scopeType === 'global' || !scopeValue ? GLOBAL_SCOPE_KEY : scopeValue
+}
+
 /**
- * Load the patterns applicable to one build.
+ * Load the patterns applicable to one build. **This is the hot read.**
  *
- * Global patterns always apply; scoped ones apply when their `scope_value`
- * matches the build's context. A scoped pattern outranks a global one at the
- * same severity because it was written about exactly this Worker/repo — that is
- * how "global patterns with scoped overrides" is expressed without a second table.
+ * It runs on every build-log retrieval, so its cost is what a busy day actually
+ * bills. Two things make it a `SEARCH ... USING INDEX` instead of a full `SCAN`:
+ *
+ * - **One indexed selector.** Applicability used to be a six-way `OR` across
+ *   `scope_type`, which SQLite cannot satisfy from a single index — so this query
+ *   read every row in the table. `scope_key` collapses that choice into one
+ *   value, making it a single `IN (…)` lookup on `idx_patterns_applicable`.
+ * - **A partial index.** `idx_patterns_applicable` is `WHERE deleted_at IS NULL`,
+ *   so soft-deleted patterns are not in the index and are never read here.
+ *
+ * Verify with `pnpm run db:explain`, which fails if this plan degrades to a SCAN.
  */
 export async function loadApplicablePatterns(
-  db: D1Database,
+  db: Db,
   ctx: { accountId?: string; workerName?: string; repository?: string; includeDeprecated?: boolean }
 ): Promise<PatternRow[]> {
-  const values = [ctx.accountId ?? '', ctx.workerName ?? '', ctx.repository ?? '']
-  const statusClause = ctx.includeDeprecated ? '' : " AND status != 'deprecated'"
-  const { results } = await db
-    .prepare(
-      `SELECT * FROM build_patterns
-        WHERE deleted_at IS NULL${statusClause}
-          AND (scope_type = 'global'
-               OR (scope_type = 'account'    AND scope_value = ?)
-               OR (scope_type = 'worker'     AND scope_value = ?)
-               OR (scope_type = 'repository' AND scope_value = ?)
-               OR scope_type IN ('framework','tool'))
-        LIMIT ?`
-    )
-    .bind(...values, MAX_PATTERNS_EVALUATED)
-    .all<PatternRow>()
-  return results ?? []
+  const keys = [GLOBAL_SCOPE_KEY, ctx.accountId, ctx.workerName, ctx.repository].filter(
+    (k): k is string => Boolean(k)
+  )
+
+  const where = [isNull(buildPatterns.deletedAt), inArray(buildPatterns.scopeKey, keys)]
+  if (!ctx.includeDeprecated) where.push(ne(buildPatterns.status, 'deprecated'))
+
+  return await db
+    .select()
+    .from(buildPatterns)
+    .where(and(...where))
+    .limit(MAX_PATTERNS_EVALUATED)
+}
+
+/**
+ * Record that patterns matched a build.
+ *
+ * **This is the hot write, and D1 charges 1000x more per written row than per
+ * read row**, so it is deliberately one written row per match:
+ *
+ * - `occurrence_count` and `last_matched_at` are the only columns written, and
+ *   **neither is indexed** — an indexed column would add a second written row to
+ *   every match.
+ * - There is no per-match row in `build_pattern_events`. An earlier version wrote
+ *   one, which tripled the cost of the hottest path to record what these two
+ *   columns already say — and accumulating per-build match rows is exactly the
+ *   log telemetry this Worker does not keep.
+ * - The updates go through `db.batch()`: one round trip instead of N.
+ */
+export async function recordMatches(
+  db: Db,
+  patternIds: string[],
+  at = new Date().toISOString()
+): Promise<void> {
+  if (!patternIds.length) return
+  const statements = patternIds.map((id) =>
+    db
+      .update(buildPatterns)
+      .set({
+        occurrenceCount: sql`${buildPatterns.occurrenceCount} + 1`,
+        lastMatchedAt: at
+      })
+      .where(eq(buildPatterns.patternId, id))
+  )
+  await db.batch(statements as [(typeof statements)[number], ...typeof statements])
 }
 
 // ---------------------------------------------------------------------------
@@ -271,22 +299,33 @@ export function similarity(a: string, b: string): number {
 /**
  * Warn about likely duplicates before creating a pattern. Advisory only: it
  * returns candidates for the caller to consider, it does not block the write.
+ *
+ * Similarity is textual, so the candidate set cannot be narrowed by an index —
+ * this read is bounded instead, and only ever runs on a create, which is an
+ * authoring action rather than a hot path.
  */
 export async function findLikelyDuplicates(
-  db: D1Database,
-  candidate: { title: string; match_expression: string },
+  db: Db,
+  candidate: { title: string; matchExpression: string },
   threshold = 0.6
 ): Promise<Array<{ pattern_id: string; title: string; score: number; match_expression: string }>> {
-  const { results } = await db
-    .prepare(
-      'SELECT pattern_id, title, match_expression FROM build_patterns WHERE deleted_at IS NULL LIMIT 500'
-    )
-    .all<{ pattern_id: string; title: string; match_expression: string }>()
-  return (results ?? [])
+  const rows = await db
+    .select({
+      patternId: buildPatterns.patternId,
+      title: buildPatterns.title,
+      matchExpression: buildPatterns.matchExpression
+    })
+    .from(buildPatterns)
+    .where(isNull(buildPatterns.deletedAt))
+    .limit(DUPLICATE_SCAN_LIMIT)
+
+  return rows
     .map((r) => ({
-      ...r,
+      pattern_id: r.patternId,
+      title: r.title,
+      match_expression: r.matchExpression,
       score: Math.max(
-        similarity(candidate.match_expression, r.match_expression),
+        similarity(candidate.matchExpression, r.matchExpression),
         similarity(candidate.title, r.title)
       )
     }))
@@ -295,8 +334,18 @@ export async function findLikelyDuplicates(
     .slice(0, 5)
 }
 
+/** Hard bound on the duplicate-detection read, so a large library cannot surprise the bill. */
+export const DUPLICATE_SCAN_LIMIT = 300
+
+/**
+ * Append a management event: created / updated / deleted / deprecated /
+ * resolved / not_resolved.
+ *
+ * Deliberately NOT called when a pattern merely matches a log — see
+ * `recordMatches`. These are authoring actions and happen rarely.
+ */
 export async function recordPatternEvent(
-  db: D1Database,
+  db: Db,
   e: {
     patternId: string
     event: string
@@ -306,18 +355,34 @@ export async function recordPatternEvent(
     evidence?: string
   }
 ): Promise<void> {
-  await db
-    .prepare(
-      'INSERT INTO build_pattern_events (pattern_id, event, build_uuid, actor, notes, evidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    )
-    .bind(
-      e.patternId,
-      e.event,
-      e.buildUuid ?? null,
-      e.actor ?? null,
-      e.notes ? redactText(e.notes).slice(0, 4000) : null,
-      e.evidence ? redactText(e.evidence).slice(0, 4000) : null,
-      new Date().toISOString()
-    )
-    .run()
+  await db.insert(buildPatternEvents).values({
+    patternId: e.patternId,
+    event: e.event,
+    buildUuid: e.buildUuid ?? null,
+    actor: e.actor ?? null,
+    notes: e.notes ? redactText(e.notes).slice(0, 4000) : null,
+    evidence: e.evidence ? redactText(e.evidence).slice(0, 4000) : null,
+    createdAt: new Date().toISOString()
+  })
+}
+
+/** Newest-first management history for one pattern (`idx_pattern_events`). */
+export async function patternHistory(
+  db: Db,
+  patternId: string,
+  limit = 50
+): Promise<Array<Record<string, unknown>>> {
+  return await db
+    .select({
+      event: buildPatternEvents.event,
+      build_uuid: buildPatternEvents.buildUuid,
+      actor: buildPatternEvents.actor,
+      notes: buildPatternEvents.notes,
+      evidence: buildPatternEvents.evidence,
+      created_at: buildPatternEvents.createdAt
+    })
+    .from(buildPatternEvents)
+    .where(eq(buildPatternEvents.patternId, patternId))
+    .orderBy(desc(buildPatternEvents.id))
+    .limit(Math.min(limit, 100))
 }

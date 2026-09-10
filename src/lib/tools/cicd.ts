@@ -6,6 +6,8 @@
  * held against the Worker, and an audit trail.
  */
 
+import { and, eq, sql } from 'drizzle-orm'
+import { cicdState } from '../../db/schema'
 import { CloudflareApiError, type Trigger } from '../cf-builds'
 import {
   detectDrift,
@@ -52,11 +54,11 @@ const MANUAL_BUILD_NOTE =
 
 function describeLease(l: LeaseRow) {
   return {
-    lease_id: l.lease_id,
+    lease_id: l.leaseId,
     owner: l.owner,
     reason: l.reason,
-    acquired_at: l.acquired_at,
-    expires_at: l.expires_at,
+    acquired_at: l.acquiredAt,
+    expires_at: l.expiresAt,
     expired: isExpired(l)
   }
 }
@@ -169,9 +171,9 @@ const cicdGet: ToolDefinition = {
         'A trigger carries the pause sentinel remotely, but this server has no pause recorded — restoring it needs the original branch matchers, which were not saved here. Restore them manually or re-pause and resume through this server.'
       )
     }
-    if (state && state.worker_tag !== workerTag) {
+    if (state && state.workerTag !== workerTag) {
       discrepancies.push(
-        `The Worker tag changed (recorded ${state.worker_tag}, now ${workerTag}). The Worker was deleted and recreated; any saved configuration belongs to the previous Worker and will NOT be restored.`
+        `The Worker tag changed (recorded ${state.workerTag}, now ${workerTag}). The Worker was deleted and recreated; any saved configuration belongs to the previous Worker and will NOT be restored.`
       )
     }
     if (state && (state.phase === 'pausing' || state.phase === 'resuming')) {
@@ -202,8 +204,8 @@ const cicdGet: ToolDefinition = {
       pause: {
         remote_shows_paused: remotePaused,
         local_phase: state?.phase ?? 'active',
-        paused_at: state?.paused_at ?? null,
-        saved_config_present: Boolean(state?.saved_config),
+        pausedAt: state?.pausedAt ?? null,
+        saved_config_present: Boolean(state?.savedConfig),
         active_leases: leases.map(describeLease),
         mechanism: PAUSE_MECHANISM_NOTE
       },
@@ -313,17 +315,21 @@ const cicdConfigure: ToolDefinition = {
       if (paused && updateSaved) {
         // Rewrite the SAVED snapshot only. The live (paused) trigger is untouched,
         // so this cannot resume the Worker by accident.
-        const saved: TriggerSnapshot[] = state?.saved_config ? JSON.parse(state.saved_config) : []
+        const saved: TriggerSnapshot[] = state?.savedConfig ? JSON.parse(state.savedConfig) : []
         const updated = saved.map((s) =>
           s.trigger_uuid === target.trigger_uuid ? { ...s, ...patch } : s
         )
         if (!dryRun) {
           await ctx.db
-            .prepare(
-              'UPDATE cicd_state SET saved_config = ?, revision = revision + 1, updated_at = ? WHERE account_id = ? AND worker_name = ?'
+            .update(cicdState)
+            .set({
+              savedConfig: JSON.stringify(updated),
+              revision: sql`${cicdState.revision} + 1`,
+              updatedAt: new Date().toISOString()
+            })
+            .where(
+              and(eq(cicdState.accountId, ctx.accountId), eq(cicdState.workerName, workerName))
             )
-            .bind(JSON.stringify(updated), new Date().toISOString(), ctx.accountId, workerName)
-            .run()
           await audit(ctx.db, {
             accountId: ctx.accountId,
             workerName,
@@ -568,11 +574,11 @@ const cicdPause: ToolDefinition = {
       // Snapshot BEFORE touching Cloudflare, and only when nothing is saved yet —
       // capturing a config that is already paused would make resume restore a pause.
       const snapshots = triggers.map(snapshotTrigger)
-      const alreadyHasSnapshot = Boolean(state?.saved_config)
+      const alreadyHasSnapshot = Boolean(state?.savedConfig)
       const snapshotJson = alreadyHasSnapshot ? null : JSON.stringify(snapshots)
       const expectedJson = JSON.stringify(
         (alreadyHasSnapshot
-          ? (JSON.parse(state!.saved_config!) as TriggerSnapshot[])
+          ? (JSON.parse(state!.savedConfig!) as TriggerSnapshot[])
           : snapshots
         ).map(expectedPaused)
       )
@@ -583,17 +589,17 @@ const cicdPause: ToolDefinition = {
         state ? { revision: state.revision } : null,
         {
           phase: 'pausing',
-          saved_config: snapshotJson ?? undefined,
-          saved_at: snapshotJson ? new Date().toISOString() : undefined,
-          expected_config: expectedJson,
-          paused_at: state?.paused_at ?? new Date().toISOString()
+          savedConfig: snapshotJson ?? undefined,
+          savedAt: snapshotJson ? new Date().toISOString() : undefined,
+          expectedConfig: expectedJson,
+          pausedAt: state?.pausedAt ?? new Date().toISOString()
         }
       )
       if (!ok) {
         throw new ToolError(
           'concurrent_modification',
           "Another caller changed this Worker's pause state at the same time. The lease was recorded; re-run workers_cicd_pause to complete the transition.",
-          { lease_id: lease.lease.lease_id }
+          { lease_id: lease.lease.leaseId }
         )
       }
 
@@ -625,7 +631,7 @@ const cicdPause: ToolDefinition = {
         throw new ToolError(
           'partial_failure',
           `Cloudflare rejected the pause for ${failures.length} of ${triggers.length} trigger(s). The saved configuration is intact and this Worker is recorded in the "pausing" phase; run workers_cicd_reconcile to finish or unwind it. Your lease is held.`,
-          { lease_id: lease.lease.lease_id, failures, phase: 'pausing' }
+          { lease_id: lease.lease.leaseId, failures, phase: 'pausing' }
         )
       }
 
@@ -633,7 +639,7 @@ const cicdPause: ToolDefinition = {
         ctx.db,
         { accountId: ctx.accountId, workerName, workerTag },
         { revision: state!.revision },
-        { phase: 'paused', paused_at: state!.paused_at ?? new Date().toISOString() }
+        { phase: 'paused', pausedAt: state!.pausedAt ?? new Date().toISOString() }
       )
     }
 
@@ -655,13 +661,13 @@ const cicdPause: ToolDefinition = {
       workerName,
       action: 'pause',
       actor: ctx.actor,
-      detail: { lease_id: lease.lease.lease_id, owner, applied, cancelled }
+      detail: { lease_id: lease.lease.leaseId, owner, applied, cancelled }
     })
     const leases = await listActiveLeases(ctx.db, ctx.accountId, workerName)
 
     return {
       worker_name: workerName,
-      lease_id: lease.lease.lease_id,
+      lease_id: lease.lease.leaseId,
       lease_created: lease.created,
       idempotent_replay: !lease.created,
       phase: 'paused',
@@ -721,7 +727,7 @@ const cicdResume: ToolDefinition = {
     }
 
     let state = await getState(ctx.db, ctx.accountId, workerName)
-    if (!state || !state.saved_config) {
+    if (!state || !state.savedConfig) {
       // Still release the caller's lease so a stale one cannot linger.
       if (leaseId) await releaseLease(ctx.db, ctx.accountId, workerName, leaseId)
       return {
@@ -734,11 +740,11 @@ const cicdResume: ToolDefinition = {
         )
       }
     }
-    if (state.worker_tag !== workerTag) {
+    if (state.workerTag !== workerTag) {
       throw new ToolError(
         'worker_recreated',
-        `The saved configuration belongs to Worker tag ${state.worker_tag}, but "${workerName}" now has tag ${workerTag}. The Worker was deleted and recreated, so the saved configuration is not applicable and was NOT applied. Delete the stale state deliberately or reconfigure from scratch.`,
-        { saved_tag: state.worker_tag, current_tag: workerTag }
+        `The saved configuration belongs to Worker tag ${state.workerTag}, but "${workerName}" now has tag ${workerTag}. The Worker was deleted and recreated, so the saved configuration is not applicable and was NOT applied. Delete the stale state deliberately or reconfigure from scratch.`,
+        { saved_tag: state.workerTag, current_tag: workerTag }
       )
     }
 
@@ -757,7 +763,7 @@ const cicdResume: ToolDefinition = {
         workerName,
         action: 'resume_blocked_by_lease',
         actor: ctx.actor,
-        detail: { released, remaining: remaining.map((l) => l.lease_id) }
+        detail: { released, remaining: remaining.map((l) => l.leaseId) }
       })
       return {
         worker_name: workerName,
@@ -771,9 +777,9 @@ const cicdResume: ToolDefinition = {
       }
     }
 
-    const saved = JSON.parse(state.saved_config) as TriggerSnapshot[]
-    const expected = state.expected_config
-      ? (JSON.parse(state.expected_config) as TriggerSnapshot[])
+    const saved = JSON.parse(state.savedConfig) as TriggerSnapshot[]
+    const expected = state.expectedConfig
+      ? (JSON.parse(state.expectedConfig) as TriggerSnapshot[])
       : saved.map(expectedPaused)
     const live = await ctx.cf.listTriggers(workerTag)
     const drift = detectDrift(expected, live)
@@ -923,7 +929,7 @@ const cicdReconcile: ToolDefinition = {
     const report = {
       worker_name: workerName,
       recorded_phase: state.phase,
-      recorded_tag: state.worker_tag,
+      recorded_tag: state.workerTag,
       current_tag: workerTag,
       remote_paused_triggers: remotePaused,
       remote_unpaused_triggers: notPaused,
@@ -947,10 +953,10 @@ const cicdReconcile: ToolDefinition = {
         ctx.db,
         { accountId: ctx.accountId, workerName, workerTag },
         { revision: state.revision },
-        { phase: 'paused', paused_at: state.paused_at ?? new Date().toISOString() }
+        { phase: 'paused', pausedAt: state.pausedAt ?? new Date().toISOString() }
       )
     } else {
-      const saved = state.saved_config ? (JSON.parse(state.saved_config) as TriggerSnapshot[]) : []
+      const saved = state.savedConfig ? (JSON.parse(state.savedConfig) as TriggerSnapshot[]) : []
       for (const snap of saved) await ctx.cf.updateTrigger(snap.trigger_uuid, restorePatch(snap))
       const after = await ctx.cf.listTriggers(workerTag)
       if (detectDrift(saved, after).pauseFieldDrift.length === 0) {

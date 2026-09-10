@@ -113,7 +113,7 @@ For Cloudflare Workers Builds (dash CI/CD), set the **Deploy command** to `pnpm 
 `wrangler.jsonc` declares the bindings the worker needs:
 
 - **KV:** `SESSION` (Astro sessions), `OAUTH_KV` (issued tokens, auth codes, client registrations)
-- **D1:** `CICD_DB` — pause/resume state and the failure-pattern library. Apply the schema with `wrangler d1 migrations apply CICD_DB --remote -c ./wrangler.jsonc`.
+- **D1:** `CICD_DB` — pause/resume state and the failure-pattern library. Schema is Drizzle (`src/db/schema.ts`): `pnpm run db:generate` to write a migration, `pnpm run db:migrate` to apply it.
 - **Secrets Store:** `WORKER_API_KEY` (the access gate), `CLOUDFLARE_WRANGLER_API_TOKEN` (privileged token forwarded upstream), `CLOUDFLARE_USER_WRANGLER_API_TOKEN` (the CI/CD tools — see the note below), `GH_TOKEN` (read-only, for PR correlation), `CLOUDFLARE_ACCOUNT_ID` (injected into `execute`), `REUI_LICENSE_KEY`
 - **Var:** `UPSTREAM_MCP_URL` (defaults to `https://mcp.cloudflare.com/mcp`)
 - `preview_urls` is `false` — see DEPLOY.md.
@@ -135,7 +135,14 @@ The upstream token can be either a **user token** or an **account token**; for a
 pnpm run dev          # astro dev
 pnpm run check        # format:check + lint + typecheck
 pnpm run test         # vitest (Workers pool)
+pnpm run db:generate  # drizzle-kit → migrations/
+pnpm run db:migrate   # apply migrations to the remote D1
+pnpm run db:explain   # EXPLAIN QUERY PLAN every hot query; fails if one starts scanning
 ```
+
+D1 bills by rows **scanned** and rows **written**, so `db:explain` is a real gate,
+not a nicety: it runs against the actual database and exits non-zero if a hot query
+loses its index. Run it before merging a schema or query change.
 
 See **[AGENTS.md](./AGENTS.md)** for architecture, conventions, and contribution guidance.
 

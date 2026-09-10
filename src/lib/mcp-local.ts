@@ -13,6 +13,7 @@
  * only after the request has already passed the bearer check in `mcp.ts`.
  */
 
+import { getDb } from '../db/client'
 import { CloudflareApiError, CloudflareBuildsClient } from './cf-builds'
 import { GitHubClient, GitHubUnavailable } from './github'
 import { buildTools } from './tools/builds'
@@ -185,7 +186,7 @@ export async function buildToolContext(env: LocalToolEnv, actor: string): Promis
   const ghToken = (await env.GH_TOKEN?.get().catch(() => undefined)) ?? null
 
   return {
-    db: env.CICD_DB,
+    db: getDb(env.CICD_DB),
     cf: new CloudflareBuildsClient({ token, accountId }),
     gh: new GitHubClient(ghToken),
     accountId,
@@ -204,6 +205,8 @@ export async function moduleHealth(env: LocalToolEnv): Promise<Record<string, un
   }
 
   try {
+    // Raw D1 on purpose: this asks SQLite what tables exist, which is a schema
+    // question Drizzle has no model for.
     const row = await env.CICD_DB?.prepare(
       "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('cicd_state','cicd_leases','cicd_audit','build_patterns','build_pattern_events')"
     ).first<{ n: number }>()
