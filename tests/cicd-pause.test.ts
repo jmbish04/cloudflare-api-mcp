@@ -110,3 +110,18 @@ describe('mergeConfigPatch', () => {
     expect(res.patch).toEqual({})
   })
 })
+
+describe('pause scope is stated honestly', () => {
+  it('never claims to suppress preview builds', async () => {
+    // MEASURED 2026-09-10: Cloudflare ran a PR build under trigger 59918e36-…
+    // while GET /builds/workers/{tag}/triggers returned only the production
+    // trigger, that uuid 404s when fetched, and the build was absent from the
+    // per-Worker build list. Nothing can pause a trigger the API will not show,
+    // so the tool must not promise it does. This test exists because the first
+    // version of that string said "production and preview".
+    const { MANUAL_BUILD_NOTE } = await import('../src/lib/tools/cicd')
+    expect(MANUAL_BUILD_NOTE).not.toMatch(/production and preview/)
+    expect(MANUAL_BUILD_NOTE).toMatch(/IMPLICIT PREVIEW TRIGGER/)
+    expect(MANUAL_BUILD_NOTE).toMatch(/preview_triggers_not_pausable/)
+  })
+})

@@ -416,6 +416,8 @@ const prBuildLogs: ToolDefinition = {
       result.message = fork
         ? `No build correlates to PR #${prNumber}. This is a fork PR, and Cloudflare does not build fork pull requests by default — that is the most likely reason there is nothing to find.`
         : `No build in the scanned window correlates to PR #${prNumber}. Widen lookback_days, or the PR may predate the Worker's CI/CD configuration.`
+      result.upstream_limitation =
+        'Before concluding no build ran: GET /builds/workers/{tag}/builds does not return builds produced by an implicit preview trigger. Measured 2026-09-10 on this Worker — a PR build existed and was reachable only through the GitHub check run, while the per-Worker list omitted it and reported a total that excluded it. If the PR shows a Workers Builds check in GitHub, open its details_url for the build id and pass it to workers_build_logs_get directly.'
       return result
     }
 

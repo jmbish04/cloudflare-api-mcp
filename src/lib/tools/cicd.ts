@@ -49,8 +49,8 @@ import {
 
 const PAUSE_MECHANISM_NOTE =
   "A Workers Builds trigger has no enable/disable field (verified against the live API). Pausing narrows every trigger's branch_includes to a sentinel no real branch can match; resuming restores the saved matchers verbatim. branch_excludes is deliberately left alone: Cloudflare rejects excluding every branch with HTTP 400 code 12002. All other trigger fields — build command, deploy command, root directory, build token, repo connection — are left untouched, which is why a restore never needs secret material it cannot read back."
-const MANUAL_BUILD_NOTE =
-  'This suppresses AUTOMATIC builds (production and preview) because a pushed branch can no longer match a trigger. It is NOT verified to block an explicit manual build via POST /builds/triggers/{uuid}/builds, which names its branch directly.'
+export const MANUAL_BUILD_NOTE =
+  'Scope of this pause, stated precisely because the obvious assumption is wrong: it narrows every trigger that GET /builds/workers/{tag}/triggers returns, so a push can no longer match those. It does NOT cover (a) an explicit manual build via POST /builds/triggers/{uuid}/builds, which names its branch directly, or (b) an IMPLICIT PREVIEW TRIGGER. Measured 2026-09-10 on this very Worker: a PR build ran under trigger 59918e36-… while the triggers endpoint returned only the production trigger, that uuid 404s when fetched directly, and the build does not appear in the per-Worker build list. Cloudflare can run a preview trigger the API does not expose, and nothing can pause what it will not show. Check preview_triggers_not_pausable in this result.'
 
 function describeLease(l: LeaseRow) {
   return {
@@ -197,6 +197,12 @@ const cicdGet: ToolDefinition = {
         (production?.branch_includes ?? []).find((b) => b !== '*' && b !== PAUSE_SENTINEL) ?? null,
       production_trigger_uuid: production?.trigger_uuid ?? null,
       preview_trigger_uuid: preview?.trigger_uuid ?? null,
+      // A null preview_trigger_uuid does NOT mean preview builds are off.
+      // Measured 2026-09-10: this Worker builds PRs under a trigger the triggers
+      // endpoint does not return and that 404s when fetched by uuid.
+      preview_trigger_caveat: preview
+        ? undefined
+        : "No preview trigger is exposed by the API. That is not evidence that preview builds do not run: Cloudflare can build pull requests under an implicit trigger it does not list, fetch or include in the per-Worker build list. Check the PR's own check run in GitHub for those builds.",
       triggers: triggers.map(presentTrigger),
       build_variables: triggers.flatMap((t) =>
         presentBuildVariables(t).map((v) => ({ trigger_uuid: t.trigger_uuid, ...v }))
@@ -646,6 +652,18 @@ const cicdPause: ToolDefinition = {
     // Running builds are reported, never cancelled by default.
     const { builds } = await ctx.cf.listBuildsPage(workerTag, 1, 20)
     const running = builds.filter((b) => b.status && b.status !== 'stopped')
+
+    // Reuse that same fetch to look for builds attributed to a trigger the
+    // triggers endpoint never returned. Any such trigger was NOT paused above,
+    // because we were never told it exists. Costs no extra API call.
+    const knownTriggers = new Set(triggers.map((t) => t.trigger_uuid))
+    const hiddenTriggers = [
+      ...new Set(
+        builds
+          .map((b) => b.trigger?.trigger_uuid)
+          .filter((u): u is string => typeof u === 'string' && !knownTriggers.has(u))
+      )
+    ]
     const cancelled: string[] = []
     if (optBool(args, 'cancel_running_builds') && running.length) {
       for (const b of running) {
@@ -680,6 +698,16 @@ const cicdPause: ToolDefinition = {
         branch: b.build_trigger_metadata?.branch,
         created_on: b.created_on
       })),
+      // Empty is NOT proof that none exist — see the `scope` note. It only means
+      // no recent build in the per-Worker list named an unknown trigger, and that
+      // list itself excludes builds from an unexposed preview trigger.
+      preview_triggers_not_pausable: hiddenTriggers.length
+        ? {
+            trigger_uuids: hiddenTriggers,
+            warning:
+              'Recent builds ran under trigger(s) that GET /builds/workers/{tag}/triggers does not return, so they could NOT be paused and will keep building on push. Cloudflare exposes no way to reach them.'
+          }
+        : null,
       cancelled_builds: cancelled,
       mechanism: PAUSE_MECHANISM_NOTE,
       scope: MANUAL_BUILD_NOTE,

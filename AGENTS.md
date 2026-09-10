@@ -247,6 +247,17 @@ what the docs imply. Re-measure before you "fix" them.
    `while (truncated)` loop spins forever on a finished build.
 7. **A build carries `pull_request.pull_request_url`** when Cloudflare associated one, but
    never a PR number. Correlation is inference; see below.
+8. **Cloudflare can run an IMPLICIT PREVIEW TRIGGER that the API does not expose.** On
+   this very Worker, a PR build ran under trigger `59918e36-…` while
+   `GET /builds/workers/{tag}/triggers` returned **only** the production trigger, that
+   uuid **404s** when fetched directly, and the build was **absent** from
+   `GET /builds/workers/{tag}/builds` (which reported a total excluding it). Its only
+   handle was the GitHub check run's `details_url`. Three consequences, all reflected in
+   the tools: `workers_cicd_pause` **cannot** pause it (it says so, and reports any such
+   trigger it can infer as `preview_triggers_not_pausable`); a null `preview_trigger_uuid`
+   from `workers_cicd_get` is **not** evidence that preview builds are off; and
+   `workers_pr_build_logs_get` finding nothing does **not** prove no build ran — check the
+   PR's own check run. `include_preview=true` is silently ignored by the list endpoint.
 
 ### Pause: leases, snapshots and partial failure
 
