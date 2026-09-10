@@ -18,6 +18,15 @@
   "vars": {
     "UPSTREAM_MCP_URL": "https://mcp.cloudflare.com/mcp"
   },
+  "d1_databases": [
+    {
+      "binding": "CICD_DB",
+      "database_name": "cloudflare-api-mcp-cicd",
+      "database_id": "19268d0c-576c-44fb-8cda-d342756fa70f",
+      "migrations_dir": "migrations",
+      "remote": true
+    }
+  ],
   "kv_namespaces": [
     {
       "binding": "SESSION",
@@ -31,6 +40,21 @@
     }
   ],
   "secrets_store_secrets": [
+    {
+      // User-scoped Cloudflare token. MEASURED 2026-09-10: the account-scoped
+      // CLOUDFLARE_WRANGLER_API_TOKEN is refused by /accounts/{id}/builds/* with
+      // 401 code 12006 "Invalid token"; this user token returns 200. The Workers
+      // Builds API requires "Workers Builds Configuration" on a USER token.
+      "binding": "CLOUDFLARE_USER_WRANGLER_API_TOKEN",
+      "store_id": "8c42fa70938644e0a8a109744467375f",
+      "secret_name": "CLOUDFLARE_USER_WRANGLER_API_TOKEN"
+    },
+    {
+      // Read-only use: resolving a repo id and PR metadata for build correlation.
+      "binding": "GH_TOKEN",
+      "store_id": "8c42fa70938644e0a8a109744467375f",
+      "secret_name": "GH_TOKEN"
+    },
     {
       "binding": "WORKER_API_KEY",
       "store_id": "8c42fa70938644e0a8a109744467375f",

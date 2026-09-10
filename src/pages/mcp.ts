@@ -10,6 +10,14 @@ import {
   mergeDocsIntoSearch,
   parseRpc
 } from '../lib/docs-pairing'
+import {
+  buildToolContext,
+  detectLocalToolCall,
+  isToolsListRequest,
+  mergeLocalToolsIntoList
+} from '../lib/mcp-local'
+import { runLocalTool } from '../lib/mcp-local'
+import { ToolError } from '../lib/tools/context'
 
 export const prerender = false
 
@@ -225,6 +233,84 @@ async function proxySearchWithDocs(
   })
 }
 
+/**
+ * Rewrite an upstream `tools/list` response so it also advertises this server's
+ * local CI/CD tools.
+ *
+ * The upstream answers either plain JSON or an SSE stream (`text/event-stream`),
+ * and a client that only ever sees the streamed form would never learn the local
+ * tools exist — so both framings are handled. Anything unrecognised is streamed
+ * through untouched: failing to advertise a local tool is a degradation, but
+ * corrupting the upstream's tool list would break the session.
+ */
+async function mergeToolsListResponse(upstream: Response, origin: string): Promise<Response> {
+  const contentType = upstream.headers.get('Content-Type') ?? ''
+  const passthrough = () =>
+    new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: withCorsHeaders(upstream.headers, origin)
+    })
+
+  const isJson = contentType.includes('application/json')
+  const isSse = contentType.includes('text/event-stream')
+  if (!isJson && !isSse) return passthrough()
+
+  const text = await upstream.text()
+  let outText: string
+
+  if (isJson) {
+    const parsed = parseRpc(text)
+    if (!parsed)
+      return new Response(text, {
+        status: upstream.status,
+        headers: withCorsHeaders(upstream.headers, origin)
+      })
+    outText = JSON.stringify(mergeLocalToolsIntoList(parsed))
+  } else {
+    // SSE: rewrite only `data:` payloads that parse as a tools/list result.
+    outText = text
+      .split('\n')
+      .map((line) => {
+        if (!line.startsWith('data:')) return line
+        const payload = line.slice(5).trim()
+        const parsed = parseRpc(payload)
+        if (!parsed) return line
+        return `data: ${JSON.stringify(mergeLocalToolsIntoList(parsed))}`
+      })
+      .join('\n')
+  }
+
+  const headers = withCorsHeaders(upstream.headers, origin)
+  // The body was decoded and re-serialised, so drop framing headers copied from
+  // upstream — a stale Content-Length or Content-Encoding makes it undecodable.
+  headers.delete('Content-Length')
+  headers.delete('Content-Encoding')
+  headers.delete('Transfer-Encoding')
+  return new Response(outText, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers
+  })
+}
+
+/** Stable pseudonymous label for a bearer: `client-<8 hex>` of its SHA-256. */
+async function callerLabel(bearer: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(bearer))
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+  return `client-${hex.slice(0, 8)}`
+}
+
+/** JSON response for a locally-handled JSON-RPC message. */
+function localJsonResponse(payload: unknown, origin: string): Response {
+  const headers = new Headers({ 'Content-Type': 'application/json' })
+  if (origin) {
+    headers.set('Access-Control-Allow-Origin', origin)
+    headers.set('Vary', 'Origin')
+  }
+  return new Response(JSON.stringify(payload), { status: 200, headers })
+}
+
 export const ALL: APIRoute = async ({ request, url }) => {
   const origin = request.headers.get('Origin') ?? '*'
 
@@ -299,6 +385,8 @@ export const ALL: APIRoute = async ({ request, url }) => {
   // pairing. Non-POST / empty requests stream through untouched.
   let forwardedBody: BodyInit | null | undefined = request.body
   let searchCall: { id: unknown; args: Record<string, unknown> } | null = null
+  let localCall: { id: unknown; name: string; args: Record<string, unknown> } | null = null
+  let toolsList = false
   if (request.method === 'POST' && request.body) {
     const rawBody = await request.text()
     // A missing/rotated secret or a transient store error must not 500 the whole
@@ -308,7 +396,44 @@ export const ALL: APIRoute = async ({ request, url }) => {
     // The forwarded body is a re-serialized string; its length may differ from the
     // original header, so let fetch recompute Content-Length.
     forwardedHeaders.delete('Content-Length')
-    if (DOCS_PAIRING_ENABLED) searchCall = detectSearchCall(parseRpc(forwardedBody))
+    const parsedBody = parseRpc(forwardedBody)
+    if (DOCS_PAIRING_ENABLED) searchCall = detectSearchCall(parsedBody)
+    // Tools this server implements itself are answered here; everything else,
+    // including the upstream's own tools, is forwarded untouched.
+    localCall = detectLocalToolCall(parsedBody)
+    toolsList = isToolsListRequest(parsedBody)
+  }
+
+  // A local tool call never reaches the upstream and never sees its token. The
+  // bearer check above has already passed at this point.
+  if (localCall) {
+    try {
+      // Pseudonymous, stable caller label for the audit trail. Derived from the
+      // bearer so two agents are distinguishable, hashed so no fragment of a
+      // credential is ever written to D1.
+      const actor = await callerLabel(presentedToken)
+      const ctx = await buildToolContext(env as never, actor)
+      return localJsonResponse(await runLocalTool(localCall, ctx), origin)
+    } catch (err) {
+      const payload =
+        err instanceof ToolError
+          ? err.toJSON()
+          : {
+              error: 'tool_context_failed',
+              message: err instanceof Error ? err.message : String(err)
+            }
+      return localJsonResponse(
+        {
+          jsonrpc: '2.0',
+          id: localCall.id ?? null,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+            isError: true
+          }
+        },
+        origin
+      )
+    }
   }
 
   try {
@@ -334,6 +459,11 @@ export const ALL: APIRoute = async ({ request, url }) => {
       body: forwardedBody,
       redirect: 'follow'
     })
+
+    // Advertise the local CI/CD tools alongside the upstream's own.
+    if (toolsList && upstreamResponse.ok) {
+      return await mergeToolsListResponse(upstreamResponse, origin)
+    }
 
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
