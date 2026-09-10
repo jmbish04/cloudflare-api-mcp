@@ -68,3 +68,30 @@ pnpm exec wrangler deploy --dry-run -c ./wrangler.jsonc dist/server/entry.mjs --
 ```
 
 After a real deploy, load `/` (should render the landing page) and confirm the MCP connector lists the `search` / `execute` tools.
+
+## D1 migrations
+
+The CI/CD tools need the `CICD_DB` schema. Apply it once per environment, and after any new
+migration file lands:
+
+```bash
+export CLOUDFLARE_API_TOKEN="$(tokens show CLOUDFLARE_D1_KV_TOKEN --value-only)"
+export CLOUDFLARE_ACCOUNT_ID="$(tokens show CLOUDFLARE_ACCOUNT_ID --value-only)"
+npx wrangler d1 migrations apply CICD_DB --remote -c ./wrangler.jsonc
+```
+
+Workers Builds does **not** run migrations — its deploy command is `pnpm run deploy`, which
+only builds and deploys. Apply a migration before merging the code that depends on it.
+
+## Secret bindings the CI/CD tools need
+
+Both secrets already exist in the Secrets Store; the bindings are declared in
+`wrangler.jsonc`:
+
+| Binding | Why |
+| --- | --- |
+| `CLOUDFLARE_USER_WRANGLER_API_TOKEN` | The Workers Builds API. A **user**-scoped token with *Workers Builds Configuration*. Measured: the account-scoped `CLOUDFLARE_WRANGLER_API_TOKEN` returns `401 / 12006 Invalid token` on every `/builds/*` path while working fine for `/workers/scripts`. |
+| `GH_TOKEN` | Read-only GitHub access: resolving a repository id when connecting one, and PR metadata for build correlation. Everything else works without it. |
+
+Verify a deploy with `GET /health` — it checks the D1 tables and that each binding actually
+resolves, rather than reporting a hardcoded `ok`.
