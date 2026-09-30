@@ -5,6 +5,12 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: './wrangler.jsonc' },
+      // wrangler.jsonc's `main` is src/worker.ts, which re-exports Astro's
+      // handler; that imports `virtual:astro-cloudflare:*` modules only the Astro
+      // build can resolve, and the pool loads `main` for every test file. The
+      // RPC entrypoint module is the part of the entry these tests can load, and
+      // loading it here proves it resolves in workerd without Astro.
+      main: './src/rpc/cloudflare-ops.ts',
       miniflare: {
         bindings: {
           UPSTREAM_MCP_URL: 'https://mcp.cloudflare.com/mcp'

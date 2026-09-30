@@ -1,5 +1,11 @@
 {
   "name": "cloudflare-api-mcp",
+  // SOURCE entry, read by @astrojs/cloudflare 14 (via @cloudflare/vite-plugin),
+  // which bundles it into dist/server/entry.mjs. It re-exports the adapter's own
+  // fetch handler and adds the CloudflareOps RPC entrypoint. This is NOT the old
+  // "main points at build output" mistake that broke astro build - that one is
+  // still wrong; pnpm run deploy passes dist/server/entry.mjs on the CLI.
+  "main": "./src/worker.ts",
   "compatibility_date": "2026-01-12",
   "compatibility_flags": ["nodejs_compat"],
   // Preview URLs are disabled: Workers Builds preview (non-production) deployments
