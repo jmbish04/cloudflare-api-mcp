@@ -175,6 +175,20 @@ export class CloudflareBuildsClient {
     return this.#accountId
   }
 
+  /**
+   * Any account-scoped Cloudflare v4 call, with the same retries and structured
+   * errors as the Builds methods. `path` is relative to `/accounts/{acct}`. A
+   * `FormData` body is sent as multipart (Worker script upload); anything else is
+   * sent as JSON. Used by `cf-ops.ts` for Worker and resource provisioning.
+   */
+  request<T>(
+    method: string,
+    path: string,
+    init?: { body?: unknown; query?: Record<string, string | number | undefined> }
+  ): Promise<{ result: T; resultInfo?: ResultInfo }> {
+    return this.#request<T>(method, path, init)
+  }
+
   async #request<T>(
     method: string,
     path: string,
@@ -187,14 +201,20 @@ export class CloudflareBuildsClient {
 
     let lastError: CloudflareApiError | null = null
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // Multipart must let fetch set its own boundary, so no Content-Type for it.
+      const multipart = init?.body instanceof FormData
       const resp = await this.#fetch(url.toString(), {
         method,
         headers: {
           Authorization: `Bearer ${this.#token}`,
-          'Content-Type': 'application/json',
+          ...(multipart ? {} : { 'Content-Type': 'application/json' }),
           Accept: 'application/json'
         },
-        body: init?.body === undefined ? undefined : JSON.stringify(init.body)
+        body: multipart
+          ? (init!.body as FormData)
+          : init?.body === undefined
+            ? undefined
+            : JSON.stringify(init.body)
       })
 
       const text = await resp.text()
@@ -327,6 +347,8 @@ export class CloudflareBuildsClient {
 }
 
 export interface ResultInfo {
+  /** R2 bucket listing pages by cursor instead of page number. */
+  cursor?: string
   page?: number
   per_page?: number
   count?: number

@@ -29,6 +29,8 @@ The provided Wrangler config main field (dist/server/entry.mjs) doesn't point to
 
 `main` points to the file the build is about to create, so it can't exist when the build starts. The entry/assets are therefore supplied at **deploy** time via the CLI, not in the config the **build** reads.
 
+`main` *is* set, but to a **source** file, `./src/worker.ts`. `@astrojs/cloudflare` 14 reads it as the entry to bundle (its default is its own `entrypoints/server`), so pointing it at source is how the Worker exports the `CloudflareOps` RPC entrypoint beside Astro's `fetch`. The build output is still `dist/server/entry.mjs`, passed on the CLI as before.
+
 ## Cloudflare Workers Builds (dash CI/CD)
 
 Workers Builds runs its **Build command** and **Deploy command** from the Cloudflare dashboard — it does **not** read them from this repo. The default deploy command (`npx wrangler deploy`, no args) fails here with `Missing entry-point to Worker script or to assets directory`, which leaves production stale.
