@@ -1,7 +1,7 @@
 # Upstream-proxy user-token fallback: keep, drop, or re-scope the token?
 
 - **Date:** 2026-09-30
-- **Status:** Open — awaiting decision
+- **Status:** Decided 2026-09-30 — Option 1, PR #10 closed unmerged
 - **Branch / PR:** `claude/cloudflare-user-token-auth-2747b6` — [PR #10](https://github.com/jmbish04/cloudflare-api-mcp/pull/10)
 
 ## What happened
@@ -87,4 +87,25 @@ is lost from `main`, which already has the working implementation.
 
 ## Decision
 
-_(awaiting Justin)_
+**Option 1 — close PR #10 unmerged.** Justin concurred with the recommendation on
+2026-09-30.
+
+Rationale as recorded above: `main` already solves the original need (Workers build logs)
+through #11's dedicated local tools, which call the Cloudflare API directly with the user
+token — no retry, and therefore none of the double-execute hazard the proxy fallback
+carries. The fallback's remaining unique surface is dormant because
+`mcp.cloudflare.com` refuses the user token with `403 insufficient_scope`.
+
+**What was done to close it out:**
+
+- PR #10 closed without merging; `main` is unchanged by it.
+- The branch `claude/cloudflare-user-token-auth-2747b6` is **kept, not deleted**, so
+  `src/lib/upstream-auth.ts` and its 18 tests can be recovered if the upstream's scope
+  behaviour changes back or the token gains `user:read` / `account:read`.
+- Production was returned to clean `main`. During investigation the branch had been
+  deployed to production (a superset of `main`); it was replaced with a build from
+  `origin/main` and re-verified.
+
+**If this is revisited,** the trigger to watch for is the upstream accepting a
+Builds-scoped user token again — re-run the two-token comparison in the table above
+before assuming the fallback would help.
