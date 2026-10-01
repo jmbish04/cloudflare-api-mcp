@@ -177,6 +177,54 @@ call.** In order:
 mistake is avoided at tool-selection time (idempotent — repeat annotation never
 stacks the hint).
 
+### Account vs user tokens, and the 50-token wall
+
+Cloudflare's own guidance and Workers Builds' requirement point in opposite
+directions, and neither is wrong. From
+`/fundamentals/api/get-started/account-owned-tokens/`:
+
+- **Account-owned** (`cfat_`) are durable service principals with their own
+  permissions — the recommended default for CI/CD, surviving the person who made them.
+- **User tokens** act on behalf of a user and inherit a subset of that user's
+  permissions; documented as better for ad hoc scripting.
+
+The trap is one sentence of those docs: **"Some services may not support account API
+tokens yet."** Workers Builds is in that gap, which is the documented explanation for
+our measured `12006` on every `/builds/*` path. So "prefer account tokens" and
+"builds needs a user token" are both true.
+
+**Which credential administers which — measured 2026-09-30, because the intuitive
+mapping is wrong:**
+
+| Operation | Works | Fails |
+|---|---|---|
+| administer **user** tokens (`/user/tokens`) | `CLOUDFLARE_USER_TOKEN_ADMIN` | both wrangler tokens → `9109` |
+| administer **account** tokens | `CLOUDFLARE_WRANGLER_API_TOKEN` | the wrangler user token → `9109` |
+| call `/builds/*` | `CLOUDFLARE_USER_WRANGLER_API_TOKEN` | the account token → `12006` |
+
+The wrangler **user** token reaches `/builds/*` but **cannot administer tokens at
+all**. Assuming "user things need the user token" does not hold. Only one new binding
+was added for this (`CLOUDFLARE_USER_TOKEN_ADMIN`): the account surface was already
+covered, and the Secret Store was at 98 of its hard cap of 100, so the measurement
+saved a slot.
+
+**User API tokens are capped at 50 per account** (documented in
+`/fundamentals/api/rate-limits/` as "User API token quota | 50"). Measured the same
+day: **48 in use** — two from the wall. Hitting it is how a Workers Builds setup
+fails confusingly: the dashboard cannot pull tokens, and creating another is refused.
+
+**So reuse is the policy, not an optimisation.** `workers_build_token_ensure` looks
+for ONE shared build token and reports what can be reused; it is read-only unless
+explicitly given `allow_create` or `allow_roll`. `cloudflare_token_create` checks the
+quota **before** attempting a user-token create and refuses with the recovery path
+rather than letting Cloudflare answer opaquely. The recovery is
+`cloudflare_token_roll_value` (`PUT .../{id}/value`): the token keeps its id,
+policies and every association, only the secret changes, and **no quota slot is
+consumed** — which is why rolling beats creating whenever the cap is near.
+
+A token value is returned exactly once, at creation or at roll, because that is the
+only moment Cloudflare discloses it. Nothing here stores it.
+
 ### Response framing — the bug that made every local tool look broken
 
 `lib/mcp-response.ts`. Locally-served results used to be emitted with a hardcoded

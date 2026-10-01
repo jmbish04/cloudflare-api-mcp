@@ -330,7 +330,14 @@ describe('runToolForRpc build-token default for workers_cicd_configure', () => {
     const gh = {
       getRepo: async () => ({ id: 1, owner: { id: 2, login: 'o' }, default_branch: 'main' })
     } as unknown as GitHubClient
-    const ctx: ToolContext = { db: getDb(raw), cf, gh, accountId: 'acct', actor: 'test' }
+    const ctx: ToolContext = {
+      db: getDb(raw),
+      cf,
+      gh,
+      accountId: 'acct',
+      actor: 'test',
+      cfTokens: { account: 'acct-token', user: 'user-token', userAdmin: 'user-admin-token' }
+    }
     return { ctx, calls }
   }
 

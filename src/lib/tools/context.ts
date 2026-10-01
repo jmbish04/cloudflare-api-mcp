@@ -28,6 +28,20 @@ export interface ToolContext {
    * the bearer check before dispatch.
    */
   actor: string
+  /**
+   * The two Cloudflare credentials, kept separate because creating a token of a
+   * kind requires a credential of that same kind (see lib/cf-tokens.ts). Null
+   * when a binding is absent, so a tool can say which credential is missing
+   * instead of failing opaquely.
+   */
+  cfTokens: {
+    /** Account surface: API calls, and administering ACCOUNT-owned tokens. */
+    account: string | null
+    /** Reaches /builds/*. Cannot administer tokens of either kind (measured 9109). */
+    user: string | null
+    /** The ONLY credential that administers USER tokens. Null when unbound. */
+    userAdmin: string | null
+  }
 }
 
 export interface ToolDefinition {

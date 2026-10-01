@@ -19,6 +19,7 @@ import { GitHubClient, GitHubUnavailable } from './github'
 import { buildTools } from './tools/builds'
 import { cfApiTools } from './tools/cf-api'
 import { cicdSetupTools } from './tools/cicd-setup'
+import { tokenTools } from './tools/tokens'
 import { cicdTools } from './tools/cicd'
 import { patternTools } from './tools/patterns'
 import { ToolError, type ToolContext, type ToolDefinition } from './tools/context'
@@ -28,7 +29,8 @@ export const LOCAL_TOOLS: ToolDefinition[] = [
   ...buildTools,
   ...patternTools,
   ...cfApiTools,
-  ...cicdSetupTools
+  ...cicdSetupTools,
+  ...tokenTools
 ]
 
 const BY_NAME = new Map(LOCAL_TOOLS.map((t) => [t.name, t]))
@@ -153,6 +155,7 @@ export async function runLocalTool(
 export interface LocalToolEnv {
   CICD_DB?: D1Database
   CLOUDFLARE_USER_WRANGLER_API_TOKEN?: { get(): Promise<string> }
+  CLOUDFLARE_USER_TOKEN_ADMIN?: { get(): Promise<string> }
   CLOUDFLARE_WRANGLER_API_TOKEN?: { get(): Promise<string> }
   CLOUDFLARE_ACCOUNT_ID?: { get(): Promise<string> }
   GH_TOKEN?: { get(): Promise<string> }
@@ -182,9 +185,16 @@ export async function buildToolContext(env: LocalToolEnv, actor: string): Promis
       'CLOUDFLARE_ACCOUNT_ID is not resolvable in this deployment.'
     )
   }
-  const token =
-    (await env.CLOUDFLARE_USER_WRANGLER_API_TOKEN?.get().catch(() => undefined)) ??
-    (await env.CLOUDFLARE_WRANGLER_API_TOKEN?.get().catch(() => undefined))
+  // Resolved separately: token administration must present the credential whose
+  // KIND matches the token being created, so the two cannot be collapsed.
+  const userToken = await env.CLOUDFLARE_USER_WRANGLER_API_TOKEN?.get().catch(() => undefined)
+  const accountToken = await env.CLOUDFLARE_WRANGLER_API_TOKEN?.get().catch(() => undefined)
+  // Separate credential because neither wrangler token can administer user tokens:
+  // both return 9109 Unauthorized on /user/tokens (measured 2026-09-30).
+  const userAdminToken = await env.CLOUDFLARE_USER_TOKEN_ADMIN?.get().catch(() => undefined)
+  // The general client prefers the user token: it reaches /builds/* where the
+  // account token does not, and everything the account token reaches.
+  const token = userToken ?? accountToken
   if (!token) {
     throw new ToolError(
       'not_configured',
@@ -198,7 +208,12 @@ export async function buildToolContext(env: LocalToolEnv, actor: string): Promis
     cf: new CloudflareBuildsClient({ token, accountId }),
     gh: new GitHubClient(ghToken),
     accountId,
-    actor
+    actor,
+    cfTokens: {
+      account: accountToken ?? null,
+      user: userToken ?? null,
+      userAdmin: userAdminToken ?? null
+    }
   }
 }
 

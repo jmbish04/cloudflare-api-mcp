@@ -56,6 +56,16 @@
       "secret_name": "CLOUDFLARE_USER_WRANGLER_API_TOKEN"
     },
     {
+      // Administering USER API tokens (documented quota: 50 per account; measured
+      // 48 in use on 2026-09-30). MEASURED: the wrangler user token CANNOT do this
+      // (9109 Unauthorized), and neither can the account token — this credential is
+      // the only one that lists/creates/rolls user tokens. Account-owned tokens need
+      // no extra binding: CLOUDFLARE_WRANGLER_API_TOKEN already administers those.
+      "binding": "CLOUDFLARE_USER_TOKEN_ADMIN",
+      "store_id": "8c42fa70938644e0a8a109744467375f",
+      "secret_name": "CLOUDFLARE_USER_TOKEN_ADMIN"
+    },
+    {
       // Read-only use: resolving a repo id and PR metadata for build correlation.
       "binding": "GH_TOKEN",
       "store_id": "8c42fa70938644e0a8a109744467375f",
