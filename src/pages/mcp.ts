@@ -25,6 +25,15 @@ import {
   matchBuildsRoute
 } from '../lib/builds-guidance'
 import { isAuthRefusal, isBufferableResponse } from '../lib/upstream-auth'
+import {
+  extractSingleCloudflareRequest,
+  requiresUserToken,
+  type RescuedRequest
+} from '../lib/cf-request-rescue'
+import { CloudflareBuildsClient } from '../lib/cf-builds'
+import { encodeMcpResponse, repairToolResponse, validateToolResponse } from '../lib/mcp-response'
+import { reportFailure, type FailureKind } from '../lib/failure-report'
+import { getDb } from '../db/client'
 
 export const prerender = false
 
@@ -314,13 +323,37 @@ async function callerLabel(bearer: string): Promise<string> {
 }
 
 /** JSON response for a locally-handled JSON-RPC message. */
-function localJsonResponse(payload: unknown, origin: string): Response {
-  const headers = new Headers({ 'Content-Type': 'application/json' })
+function localJsonResponse(
+  payload: unknown,
+  origin: string,
+  accept: string | null,
+  onInvalid?: (problems: string[]) => void
+): Response {
+  // Validate before anything leaves. A locally-generated response that a client
+  // cannot read is the exact bug that made every workers_* tool look broken while
+  // the proxied tools worked (see lib/mcp-response.ts).
+  let out = payload
+  const problems = validateToolResponse(payload)
+  if (problems.length > 0) {
+    onInvalid?.(problems)
+    const id = (payload as { id?: unknown } | null)?.id
+    out = repairToolResponse(id, problems)
+  }
+
+  // Match the client's negotiated framing. Hardcoding JSON here is what broke
+  // every SSE client: the proxied tools came back as text/event-stream and these
+  // did not, so only the local tools appeared malformed.
+  const { body, contentType } = encodeMcpResponse(out, accept)
+  const headers = new Headers({ 'Content-Type': contentType })
+  if (contentType.includes('event-stream')) {
+    headers.set('Cache-Control', 'no-cache')
+    headers.set('Connection', 'keep-alive')
+  }
   if (origin) {
     headers.set('Access-Control-Allow-Origin', origin)
     headers.set('Vary', 'Origin')
   }
-  return new Response(JSON.stringify(payload), { status: 200, headers })
+  return new Response(body, { status: 200, headers })
 }
 
 /**
@@ -350,48 +383,6 @@ function detectBuildsExecuteCall(parsed: unknown): ReturnType<typeof matchBuilds
     return null
   }
   return pick(parsed)
-}
-
-/**
- * Append the local-tool note to an upstream response that refused a builds call.
- *
- * Returns null whenever the response should be passed through untouched — not a
- * refusal, not buffer-safe, or unparseable. Every uncertain case passes through,
- * because appending a note is never worth degrading a working response.
- *
- * @returns a replacement response carrying the note, or null to pass through
- */
-async function attachBuildsGuidance(
-  upstream: Response,
-  method: string,
-  route: NonNullable<ReturnType<typeof matchBuildsRoute>>,
-  origin: string
-): Promise<Response | null> {
-  const contentType = upstream.headers.get('Content-Type') ?? ''
-  // A GET's event stream is the open-ended notification channel; reading it to
-  // completion would hang the request. Only buffer what is safe to buffer.
-  if (!isBufferableResponse(method, contentType)) return null
-
-  const text = await upstream.text().catch(() => null)
-  if (text === null) return null
-  if (!isAuthRefusal(upstream.status, text)) {
-    // Not a credential refusal after all — hand back the body we consumed.
-    return respondWithText(upstream, text, origin)
-  }
-
-  const guidance = buildsGuidanceText(route)
-  const isSse = contentType.includes('text/event-stream')
-  const outText = isSse
-    ? rewriteSseData(text, (payload) => {
-        const parsed = parseRpc(payload)
-        return parsed ? JSON.stringify(appendGuidanceToResult(parsed, guidance)) : null
-      })
-    : (() => {
-        const parsed = parseRpc(text)
-        return parsed ? JSON.stringify(appendGuidanceToResult(parsed, guidance)) : text
-      })()
-
-  return respondWithText(upstream, outText, origin)
 }
 
 /** Re-emit an SSE body, rewriting each `data:` payload the mapper handles. */
@@ -425,8 +416,172 @@ function respondWithText(upstream: Response, text: string, origin: string): Resp
   })
 }
 
-export const ALL: APIRoute = async ({ request, url }) => {
+/** The `code` argument and rpc id of an `execute` call, when the body is one. */
+function executeCodeOf(parsed: unknown): { id: unknown; code: string } | null {
+  const pick = (msg: unknown) => {
+    if (!msg || typeof msg !== 'object') return null
+    const m = msg as {
+      id?: unknown
+      method?: unknown
+      params?: { name?: unknown; arguments?: unknown }
+    }
+    if (m.method !== 'tools/call' || m.params?.name !== 'execute') return null
+    const code = (m.params?.arguments as { code?: unknown } | undefined)?.code
+    return typeof code === 'string' ? { id: m.id, code } : null
+  }
+  if (Array.isArray(parsed)) {
+    for (const msg of parsed) {
+      const hit = pick(msg)
+      if (hit) return hit
+    }
+    return null
+  }
+  return pick(parsed)
+}
+
+/**
+ * Handle a refused Cloudflare call: replay it if we can, else point at the tool.
+ *
+ * Order matters. Replaying makes the caller's call succeed, which is the whole
+ * point; the pointer is the fallback for code we cannot faithfully substitute.
+ *
+ * @returns a response to send, or null to pass the upstream's own through
+ */
+async function rescueOrGuide(
+  upstream: Response,
+  method: string,
+  route: NonNullable<ReturnType<typeof matchBuildsRoute>>,
+  rescuable: RescuedRequest | null,
+  rpcId: unknown,
+  origin: string,
+  accept: string | null
+): Promise<Response | null> {
+  const contentType = upstream.headers.get('Content-Type') ?? ''
+  if (!isBufferableResponse(method, contentType)) return null
+
+  const text = await upstream.text().catch(() => null)
+  if (text === null) return null
+  // Not a credential refusal — hand back the body we had to consume to find out.
+  if (!isAuthRefusal(upstream.status, text)) return respondWithText(upstream, text, origin)
+
+  if (rescuable) {
+    const rescued = await rescueRefusedCall(rescuable)
+    if (rescued) {
+      const payload = {
+        jsonrpc: '2.0',
+        id: rpcId ?? null,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(rescued.payload, null, 2) }],
+          structuredContent: rescued.payload as Record<string, unknown>,
+          isError: false
+        }
+      }
+      const { body, contentType: ct } = encodeMcpResponse(payload, accept)
+      const headers = withCorsHeaders(upstream.headers, origin)
+      headers.set('Content-Type', ct)
+      headers.delete('Content-Length')
+      headers.delete('Content-Encoding')
+      headers.delete('Transfer-Encoding')
+      return new Response(body, { status: 200, headers })
+    }
+  }
+
+  // Could not replay: append the one-line pointer to the original error.
+  const guidance = buildsGuidanceText(route)
+  const isSse = contentType.includes('text/event-stream')
+  const outText = isSse
+    ? rewriteSseData(text, (payload) => {
+        const parsed = parseRpc(payload)
+        return parsed ? JSON.stringify(appendGuidanceToResult(parsed, guidance)) : null
+      })
+    : (() => {
+        const parsed = parseRpc(text)
+        return parsed ? JSON.stringify(appendGuidanceToResult(parsed, guidance)) : text
+      })()
+  return respondWithText(upstream, outText, origin)
+}
+
+/**
+ * Replay a refused Cloudflare call here, with the token that actually reaches it.
+ *
+ * This is the primary handling for a credential refusal on a forwarded `execute`:
+ * the caller's call succeeds and returns real data, rather than returning an
+ * error with advice attached. Only the faithfully-replayable shape is attempted
+ * (see lib/cf-request-rescue.ts); anything else returns null and falls through.
+ *
+ * @returns an MCP tool result carrying the real API response, or null when the
+ *   call could not be replayed
+ */
+async function rescueRefusedCall(
+  rescued: RescuedRequest
+): Promise<{ payload: unknown; usedUserToken: boolean } | null> {
+  const accountId = await env.CLOUDFLARE_ACCOUNT_ID.get().catch(() => null)
+  if (!accountId) return null
+
+  // Pick the token by measured path requirement, not by trial: /builds/* needs the
+  // user token, everything else is served by the narrower account token.
+  const needsUser = requiresUserToken(rescued.path)
+  const token = needsUser
+    ? await env.CLOUDFLARE_USER_WRANGLER_API_TOKEN?.get?.().catch(() => null)
+    : await env.CLOUDFLARE_WRANGLER_API_TOKEN?.get?.().catch(() => null)
+  if (!token) return null
+
+  try {
+    const client = new CloudflareBuildsClient({ token, accountId })
+    const { result, resultInfo } = await client.request<unknown>(rescued.method, rescued.path, {
+      query: rescued.query,
+      body: rescued.body
+    })
+    // Shaped like the upstream sandbox's own return value, so a caller that was
+    // reading `.result` / `.success` sees what it expected.
+    const payload = {
+      success: true,
+      result,
+      ...(resultInfo ? { result_info: resultInfo } : {}),
+      errors: [],
+      messages: []
+    }
+    return { payload, usedUserToken: needsUser }
+  } catch {
+    // The replay failed on its own terms (a real 404, a bad payload). Fall through
+    // so the caller sees the upstream's original response rather than ours.
+    return null
+  }
+}
+
+export const ALL: APIRoute = async ({ request, url, locals }) => {
   const origin = request.headers.get('Origin') ?? '*'
+  // Every response this server generates itself is framed to match this. See
+  // lib/mcp-response.ts for why ignoring it broke every locally-served tool.
+  const acceptHeader = request.headers.get('Accept')
+
+  /**
+   * Record one of this server's own failures without delaying the reply.
+   *
+   * Scheduled on the ExecutionContext so the response is already on its way:
+   * telemetry must never make a working call slower, and must never make a
+   * working call fail. Every path is swallowed.
+   */
+  const noteFailure = (kind: FailureKind, tool: string, detail: string): void => {
+    const run = async () => {
+      try {
+        const key = await env.WORKER_API_KEY.get().catch(() => null)
+        await reportFailure(getDb(env.CICD_DB), { kind, tool, detail }, key)
+      } catch {
+        // Reporting is best-effort by design.
+      }
+    }
+    // The Cloudflare adapter puts the ExecutionContext on locals.runtime, but the
+    // App.Locals declaration in env.d.ts is module-scoped so it does not merge —
+    // hence the narrow cast rather than a global type change.
+    const ctx = (locals as { runtime?: { ctx?: { waitUntil(p: Promise<unknown>): void } } }).runtime
+      ?.ctx
+    // Without a context the promise could be cancelled when the response returns,
+    // so it is awaited nowhere but still started: a dropped report is acceptable,
+    // a delayed response is not.
+    if (ctx) ctx.waitUntil(run())
+    else void run()
+  }
 
   if (request.method === 'OPTIONS') {
     return new Response(null, {
@@ -502,6 +657,8 @@ export const ALL: APIRoute = async ({ request, url }) => {
   let localCall: { id: unknown; name: string; args: Record<string, unknown> } | null = null
   let toolsList = false
   let buildsRoute: ReturnType<typeof matchBuildsRoute> = null
+  let rescuable: RescuedRequest | null = null
+  let rpcId: unknown = null
   if (request.method === 'POST' && request.body) {
     const rawBody = await request.text()
     // A missing/rotated secret or a transient store error must not 500 the whole
@@ -518,6 +675,12 @@ export const ALL: APIRoute = async ({ request, url }) => {
     // repeatedly read that as "blocked". Remember the route so the refusal can be
     // answered with the local tool that does work. See lib/builds-guidance.ts.
     buildsRoute = detectBuildsExecuteCall(parsedBody)
+    // Recovered up front so the refusal path has it without re-parsing the body.
+    if (buildsRoute) {
+      const ex = executeCodeOf(parsedBody)
+      rescuable = ex ? extractSingleCloudflareRequest(ex.code) : null
+      rpcId = ex?.id ?? null
+    }
     // Tools this server implements itself are answered here; everything else,
     // including the upstream's own tools, is forwarded untouched.
     localCall = detectLocalToolCall(parsedBody)
@@ -533,7 +696,12 @@ export const ALL: APIRoute = async ({ request, url }) => {
       // credential is ever written to D1.
       const actor = await callerLabel(presentedToken)
       const ctx = await buildToolContext(env as never, actor)
-      return localJsonResponse(await runLocalTool(localCall, ctx), origin)
+      return localJsonResponse(
+        await runLocalTool(localCall, ctx),
+        origin,
+        acceptHeader,
+        (problems) => noteFailure('malformed_response', localCall!.name, problems.join('; '))
+      )
     } catch (err) {
       const payload =
         err instanceof ToolError
@@ -542,6 +710,15 @@ export const ALL: APIRoute = async ({ request, url }) => {
               error: 'tool_context_failed',
               message: err instanceof Error ? err.message : String(err)
             }
+      // A ToolError is an expected, caller-actionable outcome (bad argument, 404).
+      // Anything else is this server failing, which is what wants reporting.
+      if (!(err instanceof ToolError)) {
+        noteFailure(
+          'tool_error',
+          localCall.name,
+          err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+        )
+      }
       return localJsonResponse(
         {
           jsonrpc: '2.0',
@@ -551,7 +728,8 @@ export const ALL: APIRoute = async ({ request, url }) => {
             isError: true
           }
         },
-        origin
+        origin,
+        acceptHeader
       )
     }
   }
@@ -586,16 +764,21 @@ export const ALL: APIRoute = async ({ request, url }) => {
       return await mergeToolsListResponse(upstreamResponse, origin)
     }
 
-    // A refused Workers Builds call gets the local-tool note appended. Buffering
-    // is confined to this case so ordinary traffic still streams untouched.
+    // A refused Cloudflare call is REPLAYED here with the token that reaches it,
+    // so the caller's call succeeds and returns real data. Only when the code is
+    // too complex to replay faithfully does a one-line pointer get appended
+    // instead. Buffering is confined to this case so ordinary traffic streams on.
     if (buildsRoute) {
-      const guided = await attachBuildsGuidance(
+      const handled = await rescueOrGuide(
         upstreamResponse,
         request.method,
         buildsRoute,
-        origin
+        rescuable,
+        rpcId,
+        origin,
+        acceptHeader
       )
-      if (guided) return guided
+      if (handled) return handled
     }
 
     return new Response(upstreamResponse.body, {

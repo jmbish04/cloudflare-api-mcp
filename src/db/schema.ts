@@ -247,3 +247,56 @@ export type LeaseRow = typeof cicdLeases.$inferSelect
 export type AuditRow = typeof cicdAudit.$inferSelect
 export type PatternRow = typeof buildPatterns.$inferSelect
 export type PatternEventRow = typeof buildPatternEvents.$inferSelect
+
+// ---------------------------------------------------------------------------
+// Self-reported tool failures
+// ---------------------------------------------------------------------------
+
+/**
+ * One row per distinct failure *signature*, not per occurrence.
+ *
+ * ## Why deduped
+ *
+ * D1 bills a written row at 1000x a read row, and a failure that fires on every
+ * call would otherwise write unboundedly. The signature is a hash of the stable
+ * parts (tool, kind, redacted detail) so a recurring failure increments a counter
+ * on one row instead of accumulating rows — and so the fixit issue is filed once
+ * rather than once per call.
+ *
+ * `occurrence_count` and `last_seen_at` are deliberately NOT indexed: they change
+ * on every occurrence, and an index on them would add a written row to the hot
+ * path for no read benefit. Reads are "newest unresolved", served by the partial
+ * index below, which only covers rows still needing attention.
+ *
+ * Nothing here holds a credential or a response body: `detail` is redacted before
+ * it arrives (`lib/redact.ts`) and is a short signature, not a transcript.
+ */
+export const toolFailures = sqliteTable(
+  'tool_failures',
+  {
+    /** sha256 of (tool, kind, detail), hex-truncated. Stable across occurrences. */
+    signature: text('signature').primaryKey(),
+    /** Tool the failure happened in, or 'proxy' for the forwarding path. */
+    tool: text('tool').notNull(),
+    /** Coarse class: malformed_response | tool_error | upstream_refusal | rescue_failed. */
+    kind: text('kind').notNull(),
+    /** Short redacted description. Never a body, never a credential. */
+    detail: text('detail').notNull(),
+    occurrenceCount: integer('occurrence_count').notNull().default(1),
+    firstSeenAt: text('first_seen_at').notNull(),
+    lastSeenAt: text('last_seen_at').notNull(),
+    /** Set once a fixit task has been filed, so it is never filed twice. */
+    fixitFiledAt: text('fixit_filed_at'),
+    /** The colby-maestro task id, when one was created. */
+    fixitTaskId: text('fixit_task_id'),
+    /** Set by a human/agent once addressed; keeps resolved rows out of the index. */
+    resolvedAt: text('resolved_at')
+  },
+  (t) => [
+    // Partial: only unresolved failures are ever listed, so resolved rows leave
+    // the index entirely rather than being scanned and filtered out.
+    index('idx_tool_failures_open')
+      .on(t.kind, desc(t.lastSeenAt))
+      .where(sql`resolved_at IS NULL`)
+  ]
+)

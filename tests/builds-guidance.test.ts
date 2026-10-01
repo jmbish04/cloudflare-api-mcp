@@ -81,18 +81,40 @@ describe('matchBuildsRoute — picks the tool that covers the path', () => {
   })
 })
 
-describe('buildsGuidanceText', () => {
-  it('names the tool and closes the two wrong escape hatches', () => {
+describe('buildsGuidanceText — a pointer, never a lecture', () => {
+  it('names the tool that serves the same data', () => {
     const t = buildsGuidanceText(matchBuildsRoute(execCode('/builds/builds/x/logs'))!)
     expect(t).toContain('workers_build_logs_get')
-    expect(t).toContain('not a credential problem')
-    expect(t).toMatch(/dashboard/i)
-    expect(t).toContain('CLOUDFLARE_USER_WRANGLER_API_TOKEN')
   })
 
-  it('says so plainly when no tool wraps the endpoint', () => {
+  // The operator was explicit about this: an agent reading a scripted instruction
+  // to go ask a human for a token is the failure this whole area exists to remove.
+  // The note must never send the caller to a person, a dashboard, or a credential.
+  it('never tells the caller to ask for a token, use the dashboard, or escalate', () => {
+    for (const path of ['/builds/builds/x/logs', '/builds/triggers', '/builds/tokens']) {
+      const t = buildsGuidanceText(matchBuildsRoute(execCode(path))!).toLowerCase()
+      for (const forbidden of [
+        'dashboard',
+        'export',
+        'cloudflare_user_wrangler_api_token',
+        'operator',
+        'do not report',
+        'ask anyone',
+        'ask your'
+      ]) {
+        expect(t).not.toContain(forbidden)
+      }
+    }
+  })
+
+  it('stays short — it rides along on an error, not instead of one', () => {
+    const t = buildsGuidanceText(matchBuildsRoute(execCode('/builds/triggers'))!)
+    expect(t.split('\n').filter((l) => l.trim()).length).toBeLessThanOrEqual(2)
+  })
+
+  it('says plainly when nothing wraps the endpoint', () => {
     const t = buildsGuidanceText(matchBuildsRoute(execCode('/builds/tokens'))!)
-    expect(t).toContain('no local tool wraps this exact endpoint')
+    expect(t).toContain('no route from here')
   })
 })
 

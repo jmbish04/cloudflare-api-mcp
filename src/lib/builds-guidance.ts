@@ -29,10 +29,15 @@
  *
  * ## What this does
  *
- * Given an `execute` call whose code referenced a `/builds/*` path and whose
- * result carries a Cloudflare auth refusal, it appends a short, factual note
- * naming the local tool that covers that path. It never suppresses or alters the
- * original error text, and it never fires on anything else.
+ * The primary handling is NOT a message: `lib/cf-request-rescue.ts` replays the
+ * refused call here with the token that works, so the caller's call simply
+ * succeeds. This module only covers the residue — code too complex to replay
+ * faithfully — where it appends ONE line naming the tool that serves the same
+ * data.
+ *
+ * It never instructs the caller to report anything, retry, ask for a credential,
+ * or involve a human. An agent reading a scripted "ask your operator for a token"
+ * is the failure this whole area exists to remove.
  */
 
 /** A local tool recommendation for one family of `/builds/*` paths. */
@@ -110,41 +115,16 @@ export function matchBuildsRoute(code: string): BuildsRoute | null {
  * for (exporting a token, asking the operator to use the dashboard).
  */
 export function buildsGuidanceText(route: BuildsRoute): string {
-  const lines = [
+  const tools = route.tools.length > 0 ? route.tools.join(' or ') : null
+  return [
     '',
-    '--- cloudflare-api-mcp: this is not a credential problem, and you are not blocked ---',
-    '',
-    'Every Cloudflare /builds/* path refuses the token `execute` carries, because',
-    '`execute` is forwarded upstream with an ACCOUNT-scoped token. Substituting the',
-    'user token is not possible here: the upstream rejects it with 403',
-    'insufficient_scope. So no amount of retrying, re-scoping or exporting a token',
-    'will make this call work.',
-    '',
-    `You were trying to ${route.intent}. This server already serves tools that do it,`,
-    'LOCALLY, calling the Cloudflare API with a user token that does reach /builds/*:'
-  ]
-
-  if (route.tools.length > 0) {
-    for (const t of route.tools) lines.push(`  - ${t}`)
-    lines.push('', 'Call one of those instead. They are in the tools/list you already have.')
-  } else {
-    lines.push(
-      '  (no local tool wraps this exact endpoint yet)',
-      '',
-      'Related tools that do work: workers_cicd_get, workers_builds_list,',
-      'workers_build_logs_get. If none covers what you need, say so plainly —',
-      'this endpoint genuinely has no route from here.'
-    )
-  }
-
-  lines.push(
-    '',
-    'Do NOT report this as blocked, ask for CLOUDFLARE_USER_WRANGLER_API_TOKEN to be',
-    'exported, or ask anyone to use the Cloudflare dashboard. Several agents have',
-    'done exactly that from this error while the tool above sat unused.',
-    '--- end note ---'
-  )
-  return lines.join('\n')
+    tools
+      ? `[cloudflare-api-mcp] This server could not replay the call automatically ` +
+        `(only a single literal cloudflare.request(...) can be replayed). ` +
+        `Use ${tools} — same data, and it carries the token that reaches this path.`
+      : `[cloudflare-api-mcp] No tool on this server wraps this endpoint, and ` +
+        `\`execute\` cannot reach it. This one genuinely has no route from here.`
+  ].join('\n')
 }
 
 /**

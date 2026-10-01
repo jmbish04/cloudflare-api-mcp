@@ -17,11 +17,19 @@ import { getDb } from '../db/client'
 import { CloudflareApiError, CloudflareBuildsClient } from './cf-builds'
 import { GitHubClient, GitHubUnavailable } from './github'
 import { buildTools } from './tools/builds'
+import { cfApiTools } from './tools/cf-api'
+import { cicdSetupTools } from './tools/cicd-setup'
 import { cicdTools } from './tools/cicd'
 import { patternTools } from './tools/patterns'
 import { ToolError, type ToolContext, type ToolDefinition } from './tools/context'
 
-export const LOCAL_TOOLS: ToolDefinition[] = [...cicdTools, ...buildTools, ...patternTools]
+export const LOCAL_TOOLS: ToolDefinition[] = [
+  ...cicdTools,
+  ...buildTools,
+  ...patternTools,
+  ...cfApiTools,
+  ...cicdSetupTools
+]
 
 const BY_NAME = new Map(LOCAL_TOOLS.map((t) => [t.name, t]))
 

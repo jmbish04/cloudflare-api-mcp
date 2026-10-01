@@ -141,43 +141,103 @@ A `package-lock.json` is also committed (GitHub Actions uses `npm ci`); keep bot
 ### account_id injection
 `injectAccountId` (in `mcp.ts`) splices the configured `CLOUDFLARE_ACCOUNT_ID` into `tools/call` bodies for the `execute` tool when the arg is absent, so multi-account user tokens resolve the right account. Other tools are untouched; an existing `account_id` is never overwritten. Failures fall back to no injection (best-effort, never 500s the proxy).
 
-### Builds guidance (saving agents from a misdiagnosis)
+### Making calls succeed instead of explaining failures
 
-`/builds/*` is reachable from this server's **local** `workers_*` tools (they call
-the Cloudflare API directly with `CLOUDFLARE_USER_WRANGLER_API_TOKEN`) but **not**
-from `execute`, which is forwarded upstream carrying the account-scoped token.
-Measured 2026-09-30: eight distinct `/builds/*` endpoints all return
-`12006 "Invalid token"`, while `/workers/scripts/*` and `/d1/*` return `200` on the
-same token. The user token cannot be substituted on the upstream path —
-`mcp.cloudflare.com` rejects it with `403 insufficient_scope` ("Token lacks required
-user:read or account:read scope").
+`/builds/*` is reachable from this server's **local** tools (they call the Cloudflare
+API directly with `CLOUDFLARE_USER_WRANGLER_API_TOKEN`) but **not** from `execute`,
+which is forwarded upstream carrying the account-scoped token. Measured 2026-09-30:
+eight distinct `/builds/*` endpoints all return `12006 "Invalid token"`, while
+`/workers/scripts/*` and `/d1/*` return `200` on the same token. The user token
+cannot be substituted upstream — `mcp.cloudflare.com` rejects it with
+`403 insufficient_scope`.
 
-**Several independent agents have read that `12006` as "I am blocked", and asked the
-operator to export a token or use the dashboard — while the tool that does the job
-sat in the `tools/list` they had already read.** The error is the moment that belief
-forms, so the correction is delivered there. Pure logic in `lib/builds-guidance.ts`,
-I/O in `mcp.ts`:
+At least three independent agents read that `12006` as "I am blocked" and escalated
+to the operator. **The handling is not a better error message — it is to perform the
+call.** In order:
 
-- **At tool-selection time** — `annotateExecuteDescription` appends a hint to the
-  upstream `execute` tool's own description in the merged `tools/list`, naming the
-  `workers_*` tools and saying `/builds/*` is not reachable through `execute`. It is
-  idempotent, so a re-annotated response never stacks the hint.
-- **At failure time** — `detectBuildsExecuteCall` remembers that an `execute` call's
-  code referenced a `/builds/*` path; if the response is an auth refusal
-  (`lib/upstream-auth.ts`, matching narrowly on auth wording and codes), the result
-  text gets a note naming the local tool for that path family, and explicitly closing
-  the two wrong escape hatches (exporting a token, the dashboard).
+1. **Replay it here** (`lib/cf-request-rescue.ts`). On a credential refusal, the
+   `cloudflare.request({...})` is recovered from the `execute` code and re-issued
+   server-side with the token that reaches that path. The caller's call simply
+   succeeds with real data. Only the **single-literal-call shape** is replayed —
+   where the raw API response is exactly what the code would have returned, so
+   substituting it changes nothing observable. Code that post-processes the
+   response, makes several calls, or builds arguments from runtime values is NOT
+   replayed, because returning the raw response there would silently hand back a
+   different shape than the code asked for.
+2. **Offer the direct door** (`tools/cf-api.ts`). `cloudflare_api_request` makes any
+   single Cloudflare API call server-side with correct token selection, so `execute`
+   is not the only route and there is nothing for a caller to get wrong.
+3. **One line, only if neither applied** (`lib/builds-guidance.ts`). Names the tool
+   that serves the same data. It never tells the caller to report anything, retry,
+   ask for a credential, or involve a human — a scripted "ask your operator for a
+   token" is the failure this area exists to remove, and there is a test asserting
+   that wording never reappears.
 
-**It never suppresses or rewrites the original error** — the note is appended after it,
-so anything a caller already parses keeps its shape. Path families map most-specific
-first (`/builds/builds/{uuid}/logs` before `/builds/builds`), and endpoints no local
-tool wraps (`/builds/tokens`, `/builds/account/limits`, `cancel`) say so rather than
-recommending a tool that cannot serve them.
+`execute`'s own description is also annotated in the merged `tools/list` so the
+mistake is avoided at tool-selection time (idempotent — repeat annotation never
+stacks the hint).
 
-**It fails safe.** Buffering is confined to the builds case (`isBufferableResponse`:
-plain JSON on any method, plus a POST event-stream, never a GET's open-ended
-notification stream). A non-refusal, an unparseable body, or a non-bufferable response
-is passed through untouched.
+### Response framing — the bug that made every local tool look broken
+
+`lib/mcp-response.ts`. Locally-served results used to be emitted with a hardcoded
+`Content-Type: application/json`, ignoring the client's `Accept`. Proxied tools came
+back in whatever framing the client negotiated, so the asymmetry was precise and
+baffling:
+
+```
+client sends  Accept: text/event-stream
+execute            -> text/event-stream   works
+workers_* (local)  -> application/json    client cannot read it
+```
+
+Two agents reported "your build tools return results missing a required field" and
+worked around it. **A `curl` that accepts both types cannot see this**, which is why
+it survived earlier testing. So: never hardcode the framing of a response we
+generate — `encodeMcpResponse` negotiates it, and `validateToolResponse` checks the
+envelope before it leaves, repairing anything invalid rather than sending it.
+
+### Automatic failure reporting
+
+`lib/failure-report.ts`. A failure an operator has to discover and report by hand is
+a failure many agents hit first. Every failure of this server's own is recorded in
+D1 (`tool_failures`) and the **first** occurrence of each distinct signature files a
+`fixit` task in colby-maestro against the `cloudflare-api-mcp reliability` plan.
+
+Three rules it follows:
+
+- **Never affects the response.** Scheduled on `waitUntil`, so the reply is already
+  on its way; every path is swallowed. Telemetry must never make a working call
+  slower or broken.
+- **Deduped, because a D1 write costs 1000x a read.** One row per signature with an
+  occurrence counter, not one row per occurrence.
+- **One task per signature, ever.** `fixit_filed_at` gates filing, so a defect that
+  fires a thousand times files one task. There is a test that plants the missing gate
+  and confirms the suite goes red.
+
+Nothing recorded holds a credential or a response body — `detail` is a short
+redacted signature.
+
+### Build log and CI/CD tool surface
+
+Several dedicated paths to a build log, so none of them needs two round trips:
+`workers_build_logs_get` (by UUID), `workers_build_logs_latest` (newest for a
+Worker, optionally filtered by branch/status/outcome — reports which build it chose
+and from how many candidates), `workers_build_logs_by_commit` (full or abbreviated
+sha; lists every match and diagnoses the newest), `workers_pr_build_logs_get` (repo
++ PR number), `workers_build_logs_search`.
+
+Configuration is fully managed: `workers_cicd_configure` sets repository, branch and
+path matchers, build/deploy/preview commands, root directory, caching and build
+token; `workers_build_tokens_list` and `workers_build_token_create` supply a token to
+associate (the wrapped API token's value is never logged, stored, or returned);
+`workers_cicd_validate` returns one pass/fail plus the reasoning for **every** check,
+pass and fail alike, with a remedy naming the tool that fixes it.
+
+**The validator's checks are semantic, not presence-only.** A deploy command that
+skips the build while no build command is set is a FAIL, because nothing would
+produce the output the deploy uploads — even though every field looks populated.
+That is the shape that would have broken `core-ai-tools`, and a presence-only
+validator passes it.
 
 ### Docs pairing (search → docs)
 When a client calls the `search` tool, the proxy also queries **Cloudflare's separate documentation MCP server** (`DOCS_MCP_URL` = `https://docs.mcp.cloudflare.com/mcp`) and appends the documentation to the search result, so the agent gets endpoint methods/payloads *and* product context from one call. Pure transforms live in `lib/docs-pairing.ts` (`detectSearchCall`, `deriveDocsQuery`, `pickDocsToolName`, `extractToolText`, `mergeDocsIntoSearch`); `mcp.ts` does the I/O:
