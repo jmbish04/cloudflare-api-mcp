@@ -1,10 +1,10 @@
-node_modules/
-.wrangler/
+node_modules
+.wrangler
 .env
-dist/
+dist
 *.log
 
 # local/editor junk
 .DS_Store
-.astro/
+.astro
 .claude/
