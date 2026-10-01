@@ -141,6 +141,44 @@ A `package-lock.json` is also committed (GitHub Actions uses `npm ci`); keep bot
 ### account_id injection
 `injectAccountId` (in `mcp.ts`) splices the configured `CLOUDFLARE_ACCOUNT_ID` into `tools/call` bodies for the `execute` tool when the arg is absent, so multi-account user tokens resolve the right account. Other tools are untouched; an existing `account_id` is never overwritten. Failures fall back to no injection (best-effort, never 500s the proxy).
 
+### Builds guidance (saving agents from a misdiagnosis)
+
+`/builds/*` is reachable from this server's **local** `workers_*` tools (they call
+the Cloudflare API directly with `CLOUDFLARE_USER_WRANGLER_API_TOKEN`) but **not**
+from `execute`, which is forwarded upstream carrying the account-scoped token.
+Measured 2026-09-30: eight distinct `/builds/*` endpoints all return
+`12006 "Invalid token"`, while `/workers/scripts/*` and `/d1/*` return `200` on the
+same token. The user token cannot be substituted on the upstream path —
+`mcp.cloudflare.com` rejects it with `403 insufficient_scope` ("Token lacks required
+user:read or account:read scope").
+
+**Several independent agents have read that `12006` as "I am blocked", and asked the
+operator to export a token or use the dashboard — while the tool that does the job
+sat in the `tools/list` they had already read.** The error is the moment that belief
+forms, so the correction is delivered there. Pure logic in `lib/builds-guidance.ts`,
+I/O in `mcp.ts`:
+
+- **At tool-selection time** — `annotateExecuteDescription` appends a hint to the
+  upstream `execute` tool's own description in the merged `tools/list`, naming the
+  `workers_*` tools and saying `/builds/*` is not reachable through `execute`. It is
+  idempotent, so a re-annotated response never stacks the hint.
+- **At failure time** — `detectBuildsExecuteCall` remembers that an `execute` call's
+  code referenced a `/builds/*` path; if the response is an auth refusal
+  (`lib/upstream-auth.ts`, matching narrowly on auth wording and codes), the result
+  text gets a note naming the local tool for that path family, and explicitly closing
+  the two wrong escape hatches (exporting a token, the dashboard).
+
+**It never suppresses or rewrites the original error** — the note is appended after it,
+so anything a caller already parses keeps its shape. Path families map most-specific
+first (`/builds/builds/{uuid}/logs` before `/builds/builds`), and endpoints no local
+tool wraps (`/builds/tokens`, `/builds/account/limits`, `cancel`) say so rather than
+recommending a tool that cannot serve them.
+
+**It fails safe.** Buffering is confined to the builds case (`isBufferableResponse`:
+plain JSON on any method, plus a POST event-stream, never a GET's open-ended
+notification stream). A non-refusal, an unparseable body, or a non-bufferable response
+is passed through untouched.
+
 ### Docs pairing (search → docs)
 When a client calls the `search` tool, the proxy also queries **Cloudflare's separate documentation MCP server** (`DOCS_MCP_URL` = `https://docs.mcp.cloudflare.com/mcp`) and appends the documentation to the search result, so the agent gets endpoint methods/payloads *and* product context from one call. Pure transforms live in `lib/docs-pairing.ts` (`detectSearchCall`, `deriveDocsQuery`, `pickDocsToolName`, `extractToolText`, `mergeDocsIntoSearch`); `mcp.ts` does the I/O:
 
@@ -401,6 +439,7 @@ pnpm run test
 
 - The pure-logic suites (`oauth-pkce`, `token-grants`) import from `src/lib/*` and cover PKCE (incl. the RFC 7636 vector), redirect allow-listing, the full grant flow (no-code bypass blocked, mandatory PKCE, single-use replay, redirect/client mismatch, refresh rotation).
 - `mcp-auth` and `inject-account-id` import from `src/pages/mcp.ts`.
+- `builds-guidance` and `upstream-auth` cover the misdiagnosis guard: path→tool routing (including the ordering trap where a log path also matches the list pattern), the measured `12006` refusal, SSE-framed bodies, idempotent description annotation, and the codes that must *not* match (`12013`, 404s, script errors). Both planted regressions — demoting the log route below the list route, and removing the idempotence guard — were confirmed to turn the suite red.
 - The CI/CD suites are pure except `cicd-leases`, which runs against a **local** D1 (`vitest.config.ts` overrides the remote `CICD_DB` binding with `d1Databases: { CICD_DB: 'test-cicd-db' }`) and applies `migrations/0001_*.sql` per test. It covers the acceptance behaviour directly: two agents holding leases, one releasing without resuming the other's work, the last release permitting a restore, idempotent re-pause, snapshot-not-overwritten-while-paused, and a stale-revision transition being rejected.
 - **Note:** the Workers pool needs `CLOUDFLARE_API_TOKEN` to start (the KV bindings are `remote: true`), so the suite does not run in a credential-less environment. The pure-logic suites can be exercised offline under a plain node vitest config.
 

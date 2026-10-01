@@ -18,6 +18,13 @@ import {
 } from '../lib/mcp-local'
 import { runLocalTool } from '../lib/mcp-local'
 import { ToolError } from '../lib/tools/context'
+import {
+  annotateExecuteDescription,
+  appendGuidanceToResult,
+  buildsGuidanceText,
+  matchBuildsRoute
+} from '../lib/builds-guidance'
+import { isAuthRefusal, isBufferableResponse } from '../lib/upstream-auth'
 
 export const prerender = false
 
@@ -237,6 +244,11 @@ async function proxySearchWithDocs(
  * Rewrite an upstream `tools/list` response so it also advertises this server's
  * local CI/CD tools.
  *
+ * It also annotates the upstream `execute` tool's description to say that
+ * Cloudflare `/builds/*` paths are not reachable through it and name the local
+ * tools that do reach them — catching the misdiagnosis at tool-selection time
+ * rather than only when the call has already failed.
+ *
  * The upstream answers either plain JSON or an SSE stream (`text/event-stream`),
  * and a client that only ever sees the streamed form would never learn the local
  * tools exist — so both framings are handled. Anything unrecognised is streamed
@@ -266,7 +278,7 @@ async function mergeToolsListResponse(upstream: Response, origin: string): Promi
         status: upstream.status,
         headers: withCorsHeaders(upstream.headers, origin)
       })
-    outText = JSON.stringify(mergeLocalToolsIntoList(parsed))
+    outText = JSON.stringify(annotateExecuteDescription(mergeLocalToolsIntoList(parsed)))
   } else {
     // SSE: rewrite only `data:` payloads that parse as a tools/list result.
     outText = text
@@ -276,7 +288,7 @@ async function mergeToolsListResponse(upstream: Response, origin: string): Promi
         const payload = line.slice(5).trim()
         const parsed = parseRpc(payload)
         if (!parsed) return line
-        return `data: ${JSON.stringify(mergeLocalToolsIntoList(parsed))}`
+        return `data: ${JSON.stringify(annotateExecuteDescription(mergeLocalToolsIntoList(parsed)))}`
       })
       .join('\n')
   }
@@ -309,6 +321,108 @@ function localJsonResponse(payload: unknown, origin: string): Response {
     headers.set('Vary', 'Origin')
   }
   return new Response(JSON.stringify(payload), { status: 200, headers })
+}
+
+/**
+ * Spot an `execute` call whose code reaches for a Cloudflare `/builds/*` path.
+ *
+ * Only `execute` is considered: `search` reads the OpenAPI spec (where a
+ * `/builds/*` string is the *subject* of a successful query, not an attempt to
+ * call it), and the local `workers_*` tools reach those paths perfectly well.
+ *
+ * @returns the matching route, or null when this is not such a call
+ */
+function detectBuildsExecuteCall(parsed: unknown): ReturnType<typeof matchBuildsRoute> {
+  const pick = (msg: unknown): ReturnType<typeof matchBuildsRoute> => {
+    if (!msg || typeof msg !== 'object') return null
+    const m = msg as { method?: unknown; params?: { name?: unknown; arguments?: unknown } }
+    if (m.method !== 'tools/call' || m.params?.name !== 'execute') return null
+    const args = m.params?.arguments
+    if (!args || typeof args !== 'object') return null
+    const code = (args as { code?: unknown }).code
+    return typeof code === 'string' ? matchBuildsRoute(code) : null
+  }
+  if (Array.isArray(parsed)) {
+    for (const msg of parsed) {
+      const hit = pick(msg)
+      if (hit) return hit
+    }
+    return null
+  }
+  return pick(parsed)
+}
+
+/**
+ * Append the local-tool note to an upstream response that refused a builds call.
+ *
+ * Returns null whenever the response should be passed through untouched — not a
+ * refusal, not buffer-safe, or unparseable. Every uncertain case passes through,
+ * because appending a note is never worth degrading a working response.
+ *
+ * @returns a replacement response carrying the note, or null to pass through
+ */
+async function attachBuildsGuidance(
+  upstream: Response,
+  method: string,
+  route: NonNullable<ReturnType<typeof matchBuildsRoute>>,
+  origin: string
+): Promise<Response | null> {
+  const contentType = upstream.headers.get('Content-Type') ?? ''
+  // A GET's event stream is the open-ended notification channel; reading it to
+  // completion would hang the request. Only buffer what is safe to buffer.
+  if (!isBufferableResponse(method, contentType)) return null
+
+  const text = await upstream.text().catch(() => null)
+  if (text === null) return null
+  if (!isAuthRefusal(upstream.status, text)) {
+    // Not a credential refusal after all — hand back the body we consumed.
+    return respondWithText(upstream, text, origin)
+  }
+
+  const guidance = buildsGuidanceText(route)
+  const isSse = contentType.includes('text/event-stream')
+  const outText = isSse
+    ? rewriteSseData(text, (payload) => {
+        const parsed = parseRpc(payload)
+        return parsed ? JSON.stringify(appendGuidanceToResult(parsed, guidance)) : null
+      })
+    : (() => {
+        const parsed = parseRpc(text)
+        return parsed ? JSON.stringify(appendGuidanceToResult(parsed, guidance)) : text
+      })()
+
+  return respondWithText(upstream, outText, origin)
+}
+
+/** Re-emit an SSE body, rewriting each `data:` payload the mapper handles. */
+function rewriteSseData(text: string, map: (payload: string) => string | null): string {
+  return text
+    .split('\n')
+    .map((line) => {
+      if (!line.startsWith('data:')) return line
+      const next = map(line.slice(5).trim())
+      return next === null ? line : `data: ${next}`
+    })
+    .join('\n')
+}
+
+/**
+ * Rebuild a response around a body already read as text.
+ *
+ * Framing and encoding headers are dropped: the body is decoded plaintext being
+ * re-serialized, so a copied `Content-Encoding` would have a client trying to
+ * gunzip an identity body.
+ */
+function respondWithText(upstream: Response, text: string, origin: string): Response {
+  const headers = withCorsHeaders(upstream.headers, origin)
+  headers.delete('Content-Length')
+  headers.delete('Content-Encoding')
+  headers.delete('Transfer-Encoding')
+  return new Response(text, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers
+  })
 }
 
 export const ALL: APIRoute = async ({ request, url }) => {
@@ -387,6 +501,7 @@ export const ALL: APIRoute = async ({ request, url }) => {
   let searchCall: { id: unknown; args: Record<string, unknown> } | null = null
   let localCall: { id: unknown; name: string; args: Record<string, unknown> } | null = null
   let toolsList = false
+  let buildsRoute: ReturnType<typeof matchBuildsRoute> = null
   if (request.method === 'POST' && request.body) {
     const rawBody = await request.text()
     // A missing/rotated secret or a transient store error must not 500 the whole
@@ -398,6 +513,11 @@ export const ALL: APIRoute = async ({ request, url }) => {
     forwardedHeaders.delete('Content-Length')
     const parsedBody = parseRpc(forwardedBody)
     if (DOCS_PAIRING_ENABLED) searchCall = detectSearchCall(parsedBody)
+    // An `execute` reaching for a Workers Builds path is the setup for a
+    // misdiagnosis: the upstream will refuse it on credentials and agents have
+    // repeatedly read that as "blocked". Remember the route so the refusal can be
+    // answered with the local tool that does work. See lib/builds-guidance.ts.
+    buildsRoute = detectBuildsExecuteCall(parsedBody)
     // Tools this server implements itself are answered here; everything else,
     // including the upstream's own tools, is forwarded untouched.
     localCall = detectLocalToolCall(parsedBody)
@@ -460,9 +580,22 @@ export const ALL: APIRoute = async ({ request, url }) => {
       redirect: 'follow'
     })
 
-    // Advertise the local CI/CD tools alongside the upstream's own.
+    // Advertise the local CI/CD tools alongside the upstream's own, and tell the
+    // model up front that /builds/* is not reachable through `execute`.
     if (toolsList && upstreamResponse.ok) {
       return await mergeToolsListResponse(upstreamResponse, origin)
+    }
+
+    // A refused Workers Builds call gets the local-tool note appended. Buffering
+    // is confined to this case so ordinary traffic still streams untouched.
+    if (buildsRoute) {
+      const guided = await attachBuildsGuidance(
+        upstreamResponse,
+        request.method,
+        buildsRoute,
+        origin
+      )
+      if (guided) return guided
     }
 
     return new Response(upstreamResponse.body, {
