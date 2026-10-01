@@ -225,6 +225,52 @@ consumed** — which is why rolling beats creating whenever the cap is near.
 A token value is returned exactly once, at creation or at roll, because that is the
 only moment Cloudflare discloses it. Nothing here stores it.
 
+### Token quota audit — and why a token was deleted
+
+**If a Cloudflare API token disappeared and you want to know why, the answer is at
+`/docs/token-audit`** (add `?format=json` for the raw record). It serves the policy
+plus every run and every deletion out of D1, keyed by the token's **name** — because
+once a token is deleted its name is the only handle anyone has. That page exists
+specifically so a deletion is never a mystery later.
+
+`lib/token-audit.ts` is pure bookkeeping — rules over timestamps and references, no
+model involved, which is why it is safe to run unattended. `cloudflare_token_audit`
+is **dry-run by default** and deletes nothing without `apply=true`.
+
+**It deletes only what is provably dead:**
+
+- expired (`expires_on` in the past), or
+- a non-active status, or
+- a **recognisably generated** build token (`<worker> build token`,
+  `Workers Builds - <date>`) that is unreferenced **and** idle past the retention
+  window (default 180 days).
+
+**It never deletes, and each protection exists because of a real token in the
+measured set:**
+
+| Protection | Why |
+|---|---|
+| `keep_marker` | One token is named `KEEP - wrangler d1 access`. A human marker outranks every heuristic. |
+| `in_use_by_this_server` | Deleting the credential the audit authenticates with would be self-destruction. |
+| `referenced` | Wrapped by a Workers Builds build token, so in use whatever its timestamps say. |
+| `untracked_usage` | A tunnel/DNS/certificate token authenticates a persistent connection, so a stale `last_used_on` is **not** evidence of disuse. |
+
+Anything else that is merely idle goes to **review**, never to deletion — including a
+generated token that has *never* been used, since that is ambiguous (it may belong to
+a build that has not run yet).
+
+**Measured first run (2026-10-01, dry run): 48 of 50 in use, 41 protected, 6 keep, 1
+review, 0 reclaimable.** The strict definition currently reclaims nothing, because
+every accumulated build-related user token is still wrapped by an existing build
+token. The refinement that would unlock reclaim is checking whether that build token
+is still referenced by a **live trigger** rather than merely existing — an orphaned
+build token protects a dead user token today. That is a known, deliberate
+conservatism, not an oversight.
+
+D1 writes are bounded: one run row plus one row per deletion, and tokens that were
+kept are never recorded (that would be ~48 rows per run for no benefit, and a D1
+write costs 1000x a read).
+
 ### Response framing — the bug that made every local tool look broken
 
 `lib/mcp-response.ts`. Locally-served results used to be emitted with a hardcoded

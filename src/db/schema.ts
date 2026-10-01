@@ -300,3 +300,70 @@ export const toolFailures = sqliteTable(
       .where(sql`resolved_at IS NULL`)
   ]
 )
+
+// ---------------------------------------------------------------------------
+// Token quota audit
+// ---------------------------------------------------------------------------
+
+/**
+ * One row per audit run, and one per token actually deleted.
+ *
+ * ## Why this table exists at all
+ *
+ * A deletion nobody can explain months later is worse than a full quota. The
+ * question this table has to answer is "why was this token deleted?", asked long
+ * after the fact by someone with only a token name. So a deleted token's NAME,
+ * idle age and the verdict reason are recorded permanently — the audit's reasoning
+ * outlives the token.
+ *
+ * Writes are bounded by design: a run writes one summary row plus one row per
+ * deletion, and deletions are rare (nothing is deleted unless provably dead). It
+ * never records the tokens it decided to keep — that would be ~48 rows per run for
+ * no benefit, and a D1 write costs 1000x a read.
+ *
+ * No token value is ever stored. Only ids, names and reasoning.
+ */
+export const tokenAuditRuns = sqliteTable(
+  'token_audit_runs',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    startedAt: text('started_at').notNull(),
+    /** 'dry_run' when nothing was deleted, 'applied' when deletions happened. */
+    mode: text('mode').notNull(),
+    /** Who or what ran it: a caller label, or 'cron'. */
+    actor: text('actor').notNull(),
+    tokensSeen: integer('tokens_seen').notNull(),
+    quota: integer('quota').notNull(),
+    headroomBefore: integer('headroom_before').notNull(),
+    /** Counts by verdict, as JSON, so a run is readable without joining. */
+    verdictCounts: text('verdict_counts').notNull(),
+    deletedCount: integer('deleted_count').notNull().default(0),
+    retentionDays: integer('retention_days').notNull(),
+    error: text('error')
+  },
+  (t) => [index('idx_token_audit_runs_recent').on(desc(t.startedAt))]
+)
+
+/**
+ * One row per token this audit deleted — the permanent explanation.
+ *
+ * `token_name` and `reason` are the columns that matter: the token is gone, so its
+ * name is the only handle anyone will have when asking why it disappeared.
+ */
+export const tokenAuditDeletions = sqliteTable(
+  'token_audit_deletions',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    runId: integer('run_id').notNull(),
+    deletedAt: text('deleted_at').notNull(),
+    tokenId: text('token_id').notNull(),
+    /** Kept deliberately: the only identifier a human will recognise later. */
+    tokenName: text('token_name').notNull(),
+    idleDays: integer('idle_days'),
+    /** The classifier's full reasoning, verbatim. */
+    reason: text('reason').notNull(),
+    /** Set when the delete call itself failed, so a failure is not silent. */
+    failed: integer('failed', { mode: 'boolean' }).notNull().default(false)
+  },
+  (t) => [index('idx_token_audit_deletions_name').on(t.tokenName, desc(t.deletedAt))]
+)

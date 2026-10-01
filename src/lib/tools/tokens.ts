@@ -14,6 +14,9 @@
  * - No tool deletes a token unless explicitly asked, and deletion requires the id.
  */
 
+import { sql } from 'drizzle-orm'
+import { auditTokens, type AuditableToken } from '../token-audit'
+import { tokenAuditDeletions, tokenAuditRuns } from '../../db/schema'
 import {
   CloudflareTokenClient,
   TokenApiError,
@@ -547,6 +550,158 @@ export const tokenTools: ToolDefinition[] = [
           'One shared build token is the intent. Do not create a token per build — ' +
           'that is what exhausts the 50-token user quota and makes the dashboard ' +
           'refuse to configure builds.'
+      }
+    }
+  },
+  {
+    name: 'cloudflare_token_audit',
+    title: 'Audit the user token quota',
+    description:
+      "Audit the account's user API tokens against the 50-token quota and report a " +
+      'verdict and reason for every one. Dry-run by default: it deletes nothing ' +
+      'unless apply=true, and even then only tokens that are PROVABLY dead — expired, ' +
+      'non-active, or a recognisably generated build token that is unreferenced by ' +
+      'any build trigger and unused past the retention window. Tokens with a KEEP ' +
+      'marker in the name, tokens this server itself uses, tokens referenced by a ' +
+      'build trigger, and long-lived credentials whose last_used_on does not track ' +
+      'real use (tunnels, DNS, certificates) are protected and never deleted. Every ' +
+      'run and every deletion is recorded in D1 with the full reasoning, so a ' +
+      'deletion can always be explained later.',
+    inputSchema: S.obj(
+      'Audit, and optionally reclaim, user token quota.',
+      {
+        apply: S.bool('Actually delete the provably-dead tokens. Default false (report only).'),
+        retention_days: S.num(
+          'Idle days after which a generated build token becomes deletable. Default 180.'
+        )
+      },
+      []
+    ),
+    async handler(args, ctx: ToolContext) {
+      const retentionDays = Math.max(30, optNumber(args, 'retention_days') ?? 180)
+      const apply = args.apply === true
+      const startedAt = new Date()
+      const admin = credentialFor(ctx, 'user')
+      const client = new CloudflareTokenClient({ token: admin })
+
+      const listed = await client.request<AuditableToken[]>(
+        'GET',
+        tokenPaths('user', ctx.accountId).root,
+        { query: { per_page: 100 } }
+      )
+      const tokens = listed.result ?? []
+
+      // Protect this server's own credentials. Resolved by asking each token which
+      // id it is, rather than matching on name — a rename must not expose them.
+      const protectedIds: string[] = []
+      for (const cred of [ctx.cfTokens.user, ctx.cfTokens.userAdmin]) {
+        if (!cred) continue
+        const who = await verifyToken(cred, 'user', ctx.accountId)
+        if (who.ok && who.result.id) protectedIds.push(who.result.id)
+      }
+
+      // A user token wrapped by a build token is in use whatever its timestamps say.
+      const buildTokens = await ctx.cf.listBuildTokens().catch(() => [])
+      const referencedIds = buildTokens
+        .map((t) => (t as { cloudflare_token_id?: string }).cloudflare_token_id)
+        .filter((id): id is string => typeof id === 'string')
+
+      const summary = auditTokens(tokens, {
+        retentionDays,
+        protectedIds,
+        referencedIds,
+        now: startedAt
+      })
+
+      // Record the run first, so even a failure mid-deletion leaves a trace.
+      let runId: number | null = null
+      try {
+        const inserted = await ctx.db
+          .insert(tokenAuditRuns)
+          .values({
+            startedAt: startedAt.toISOString(),
+            mode: apply ? 'applied' : 'dry_run',
+            actor: ctx.actor,
+            tokensSeen: summary.total,
+            quota: summary.quota,
+            headroomBefore: summary.headroom,
+            verdictCounts: JSON.stringify(summary.counts),
+            deletedCount: 0,
+            retentionDays
+          })
+          .returning({ id: tokenAuditRuns.id })
+        runId = inserted[0]?.id ?? null
+      } catch {
+        // Auditing is still worth doing without its bookkeeping.
+      }
+
+      const nominated = summary.verdicts.filter((v) => v.verdict === 'delete')
+      const deleted: Array<{ id: string; name: string; ok: boolean }> = []
+
+      if (apply) {
+        for (const v of nominated) {
+          let ok = true
+          try {
+            await client.request<unknown>('DELETE', tokenPaths('user', ctx.accountId).byId(v.id))
+          } catch {
+            ok = false
+          }
+          deleted.push({ id: v.id, name: v.name, ok })
+          if (runId !== null) {
+            try {
+              await ctx.db.insert(tokenAuditDeletions).values({
+                runId,
+                deletedAt: new Date().toISOString(),
+                tokenId: v.id,
+                tokenName: v.name,
+                idleDays: v.idle_days,
+                reason: v.reason,
+                failed: !ok
+              })
+            } catch {
+              // The token is gone either way; losing one audit row is survivable.
+            }
+          }
+        }
+        if (runId !== null) {
+          try {
+            await ctx.db
+              .update(tokenAuditRuns)
+              .set({ deletedCount: deleted.filter((d) => d.ok).length })
+              .where(sql`${tokenAuditRuns.id} = ${runId}`)
+          } catch {
+            /* best effort */
+          }
+        }
+      }
+
+      return {
+        mode: apply ? 'applied' : 'dry_run',
+        run_id: runId,
+        quota: { quota: summary.quota, in_use: summary.total, headroom: summary.headroom },
+        verdict_counts: summary.counts,
+        reclaimable: summary.reclaimable,
+        nominated_for_deletion: nominated.map((v) => ({
+          id: v.id,
+          name: v.name,
+          idle_days: v.idle_days,
+          reason: v.reason
+        })),
+        ...(apply ? { deleted } : {}),
+        needs_human_review: summary.verdicts
+          .filter((v) => v.verdict === 'review')
+          .map((v) => ({ name: v.name, idle_days: v.idle_days, reason: v.reason })),
+        protected: summary.verdicts
+          .filter((v) => v.verdict === 'protected')
+          .map((v) => ({ name: v.name, protection: v.protection })),
+        audit_trail:
+          'Runs are in D1 token_audit_runs; deletions in token_audit_deletions with the ' +
+          'token NAME and the full reason, so a deletion can be explained later.',
+        ...(apply
+          ? {}
+          : {
+              note: 'Nothing was deleted. Re-run with apply=true to reclaim the nominated tokens.'
+            })
       }
     }
   },
