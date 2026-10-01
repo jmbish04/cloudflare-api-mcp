@@ -141,9 +141,12 @@ export async function reportFailure(
       .limit(1)
     shouldFile = !!row[0] && row[0].filed === null
   } catch {
-    // D1 unavailable or schema not migrated. Still try to file — an unreported
-    // defect is worse than an unrecorded one.
-    shouldFile = true
+    // D1 unavailable or schema not migrated. Do NOT file in this case: without the
+    // row there is no dedupe, so a defect firing on every request would file a task
+    // per request and bury the backlog — the opposite of "one task per signature,
+    // ever". An unreported defect is recoverable; a thousand duplicate tasks is not.
+    // The recording failure is itself visible as `recorded: false`.
+    shouldFile = false
   }
 
   let filed = false

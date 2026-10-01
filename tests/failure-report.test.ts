@@ -115,7 +115,7 @@ describe('reportFailure — deduped because a D1 write costs 1000x a read', () =
   })
 
   // A maestro outage must not lose the record, and must leave the task unfiled so a
-  // later occurrence can still file it.
+  // later occurrence can still file it. (A D1 outage is the opposite case: see below.)
   it('still records when filing fails, and retries filing next time', async () => {
     const failing = stubMaestro(null)
     const out = await reportFailure(db, report, 'key')
@@ -128,6 +128,18 @@ describe('reportFailure — deduped because a D1 write costs 1000x a read', () =
     const second = await reportFailure(db, report, 'key')
     expect(second.filed).toBe(true)
     expect(ok).toHaveBeenCalledTimes(1)
+  })
+
+  // Without the D1 row there is no dedupe, so filing would be unbounded: a defect
+  // firing on every request would file a task per request. Not filing is the lesser
+  // failure, and `recorded: false` makes the problem visible.
+  it('does not file when D1 cannot record, to avoid unbounded task spam', async () => {
+    const fetchSpy = stubMaestro('task_x')
+    await raw.exec('DROP TABLE IF EXISTS tool_failures')
+    const out = await reportFailure(db, report, 'key')
+    expect(out.recorded).toBe(false)
+    expect(out.filed).toBe(false)
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 
   it('does not attempt to file without a key', async () => {

@@ -327,7 +327,8 @@ function localJsonResponse(
   payload: unknown,
   origin: string,
   accept: string | null,
-  onInvalid?: (problems: string[]) => void
+  onInvalid?: (problems: string[]) => void,
+  toolName?: string
 ): Response {
   // Validate before anything leaves. A locally-generated response that a client
   // cannot read is the exact bug that made every workers_* tool look broken while
@@ -337,7 +338,7 @@ function localJsonResponse(
   if (problems.length > 0) {
     onInvalid?.(problems)
     const id = (payload as { id?: unknown } | null)?.id
-    out = repairToolResponse(id, problems)
+    out = repairToolResponse(id, problems, toolName)
   }
 
   // Match the client's negotiated framing. Hardcoding JSON here is what broke
@@ -459,8 +460,19 @@ async function rescueOrGuide(
   const contentType = upstream.headers.get('Content-Type') ?? ''
   if (!isBufferableResponse(method, contentType)) return null
 
-  const text = await upstream.text().catch(() => null)
-  if (text === null) return null
+  // Once this read starts the body is consumed, so every path below MUST return a
+  // Response. Returning null here would send the caller on to stream a body that is
+  // already disturbed, turning a transient read failure into a 502.
+  let text: string
+  try {
+    text = await upstream.text()
+  } catch {
+    return new Response(null, {
+      status: 502,
+      statusText: 'Upstream body unreadable',
+      headers: withCorsHeaders(upstream.headers, origin)
+    })
+  }
   // Not a credential refusal — hand back the body we had to consume to find out.
   if (!isAuthRefusal(upstream.status, text)) return respondWithText(upstream, text, origin)
 
@@ -700,7 +712,8 @@ export const ALL: APIRoute = async ({ request, url, locals }) => {
         await runLocalTool(localCall, ctx),
         origin,
         acceptHeader,
-        (problems) => noteFailure('malformed_response', localCall!.name, problems.join('; '))
+        (problems) => noteFailure('malformed_response', localCall!.name, problems.join('; ')),
+        localCall.name
       )
     } catch (err) {
       const payload =

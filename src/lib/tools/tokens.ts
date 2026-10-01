@@ -490,11 +490,13 @@ export const tokenTools: ToolDefinition[] = [
       }
 
       if (sharedUserToken) {
-        const check = await verifyToken(admin, 'user', ctx.accountId)
+        // Report the shared token's own state. Verifying it directly is impossible —
+        // `verify` authenticates WITH the token, and its value is not readable — so
+        // the status the list endpoint reports is the available signal.
         actions.push(
           `A user API token named "${wantedName}" exists (${sharedUserToken.id}, status ` +
-            `${sharedUserToken.status ?? 'unknown'}).` +
-            (check.ok ? '' : ' The admin credential itself failed verification.')
+            `${sharedUserToken.status ?? 'unknown'}, last used ` +
+            `${sharedUserToken.last_used_on ?? 'never'}).`
         )
         const unusable = (sharedUserToken.status ?? '').toLowerCase() !== 'active'
         if (unusable && args.allow_roll === true) {
@@ -638,7 +640,25 @@ export const tokenTools: ToolDefinition[] = [
       const nominated = summary.verdicts.filter((v) => v.verdict === 'delete')
       const deleted: Array<{ id: string; name: string; ok: boolean }> = []
 
+      // A deletion nobody can explain is worse than a full quota, so being unable to
+      // record is a reason NOT to delete. Without the run row the per-deletion rows
+      // cannot be written either (they key off it), which would destroy tokens with
+      // no trace at /docs/token-audit — the exact outcome this feature prevents.
+      if (apply && runId === null) {
+        throw new ToolError(
+          'audit_not_recordable',
+          'Refusing to delete: the audit run could not be written to D1, so the ' +
+            'deletions could not be recorded either and the tokens would disappear ' +
+            'with no explanation. Check the CICD_DB binding and that migration ' +
+            '0003_token_audit.sql has been applied, then re-run. The dry-run report ' +
+            'above is unaffected.'
+        )
+      }
+
       if (apply) {
+        // Narrowed by the guard above, and typed so the invariant is enforced by the
+        // compiler rather than by reading the code.
+        const recordedRunId: number = runId as number
         for (const v of nominated) {
           let ok = true
           try {
@@ -647,10 +667,11 @@ export const tokenTools: ToolDefinition[] = [
             ok = false
           }
           deleted.push({ id: v.id, name: v.name, ok })
-          if (runId !== null) {
+          // runId is non-null here: the guard above refuses to delete without it.
+          {
             try {
               await ctx.db.insert(tokenAuditDeletions).values({
-                runId,
+                runId: recordedRunId,
                 deletedAt: new Date().toISOString(),
                 tokenId: v.id,
                 tokenName: v.name,
@@ -663,12 +684,12 @@ export const tokenTools: ToolDefinition[] = [
             }
           }
         }
-        if (runId !== null) {
+        {
           try {
             await ctx.db
               .update(tokenAuditRuns)
               .set({ deletedCount: deleted.filter((d) => d.ok).length })
-              .where(sql`${tokenAuditRuns.id} = ${runId}`)
+              .where(sql`${tokenAuditRuns.id} = ${recordedRunId}`)
           } catch {
             /* best effort */
           }

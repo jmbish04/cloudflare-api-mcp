@@ -90,6 +90,7 @@ export interface ApiToken {
   modified_on?: string
   expires_on?: string | null
   not_before?: string | null
+  last_used_on?: string | null
   /** Present ONLY in a creation response — Cloudflare shows it once. */
   value?: string
   policies?: unknown[]
