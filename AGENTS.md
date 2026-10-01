@@ -141,6 +141,198 @@ A `package-lock.json` is also committed (GitHub Actions uses `npm ci`); keep bot
 ### account_id injection
 `injectAccountId` (in `mcp.ts`) splices the configured `CLOUDFLARE_ACCOUNT_ID` into `tools/call` bodies for the `execute` tool when the arg is absent, so multi-account user tokens resolve the right account. Other tools are untouched; an existing `account_id` is never overwritten. Failures fall back to no injection (best-effort, never 500s the proxy).
 
+### Making calls succeed instead of explaining failures
+
+`/builds/*` is reachable from this server's **local** tools (they call the Cloudflare
+API directly with `CLOUDFLARE_USER_WRANGLER_API_TOKEN`) but **not** from `execute`,
+which is forwarded upstream carrying the account-scoped token. Measured 2026-09-30:
+eight distinct `/builds/*` endpoints all return `12006 "Invalid token"`, while
+`/workers/scripts/*` and `/d1/*` return `200` on the same token. The user token
+cannot be substituted upstream — `mcp.cloudflare.com` rejects it with
+`403 insufficient_scope`.
+
+At least three independent agents read that `12006` as "I am blocked" and escalated
+to the operator. **The handling is not a better error message — it is to perform the
+call.** In order:
+
+1. **Replay it here** (`lib/cf-request-rescue.ts`). On a credential refusal, the
+   `cloudflare.request({...})` is recovered from the `execute` code and re-issued
+   server-side with the token that reaches that path. The caller's call simply
+   succeeds with real data. Only the **single-literal-call shape** is replayed —
+   where the raw API response is exactly what the code would have returned, so
+   substituting it changes nothing observable. Code that post-processes the
+   response, makes several calls, or builds arguments from runtime values is NOT
+   replayed, because returning the raw response there would silently hand back a
+   different shape than the code asked for.
+2. **Offer the direct door** (`tools/cf-api.ts`). `cloudflare_api_request` makes any
+   single Cloudflare API call server-side with correct token selection, so `execute`
+   is not the only route and there is nothing for a caller to get wrong.
+3. **One line, only if neither applied** (`lib/builds-guidance.ts`). Names the tool
+   that serves the same data. It never tells the caller to report anything, retry,
+   ask for a credential, or involve a human — a scripted "ask your operator for a
+   token" is the failure this area exists to remove, and there is a test asserting
+   that wording never reappears.
+
+`execute`'s own description is also annotated in the merged `tools/list` so the
+mistake is avoided at tool-selection time (idempotent — repeat annotation never
+stacks the hint).
+
+### Account vs user tokens, and the 50-token wall
+
+Cloudflare's own guidance and Workers Builds' requirement point in opposite
+directions, and neither is wrong. From
+`/fundamentals/api/get-started/account-owned-tokens/`:
+
+- **Account-owned** (`cfat_`) are durable service principals with their own
+  permissions — the recommended default for CI/CD, surviving the person who made them.
+- **User tokens** act on behalf of a user and inherit a subset of that user's
+  permissions; documented as better for ad hoc scripting.
+
+The trap is one sentence of those docs: **"Some services may not support account API
+tokens yet."** Workers Builds is in that gap, which is the documented explanation for
+our measured `12006` on every `/builds/*` path. So "prefer account tokens" and
+"builds needs a user token" are both true.
+
+**Which credential administers which — measured 2026-09-30, because the intuitive
+mapping is wrong:**
+
+| Operation | Works | Fails |
+|---|---|---|
+| administer **user** tokens (`/user/tokens`) | `CLOUDFLARE_USER_TOKEN_ADMIN` | both wrangler tokens → `9109` |
+| administer **account** tokens | `CLOUDFLARE_WRANGLER_API_TOKEN` | the wrangler user token → `9109` |
+| call `/builds/*` | `CLOUDFLARE_USER_WRANGLER_API_TOKEN` | the account token → `12006` |
+
+The wrangler **user** token reaches `/builds/*` but **cannot administer tokens at
+all**. Assuming "user things need the user token" does not hold. Only one new binding
+was added for this (`CLOUDFLARE_USER_TOKEN_ADMIN`): the account surface was already
+covered, and the Secret Store was at 98 of its hard cap of 100, so the measurement
+saved a slot.
+
+**User API tokens are capped at 50 per account** (documented in
+`/fundamentals/api/rate-limits/` as "User API token quota | 50"). Measured the same
+day: **48 in use** — two from the wall. Hitting it is how a Workers Builds setup
+fails confusingly: the dashboard cannot pull tokens, and creating another is refused.
+
+**So reuse is the policy, not an optimisation.** `workers_build_token_ensure` looks
+for ONE shared build token and reports what can be reused; it is read-only unless
+explicitly given `allow_create` or `allow_roll`. `cloudflare_token_create` checks the
+quota **before** attempting a user-token create and refuses with the recovery path
+rather than letting Cloudflare answer opaquely. The recovery is
+`cloudflare_token_roll_value` (`PUT .../{id}/value`): the token keeps its id,
+policies and every association, only the secret changes, and **no quota slot is
+consumed** — which is why rolling beats creating whenever the cap is near.
+
+A token value is returned exactly once, at creation or at roll, because that is the
+only moment Cloudflare discloses it. Nothing here stores it.
+
+### Token quota audit — and why a token was deleted
+
+**If a Cloudflare API token disappeared and you want to know why, the answer is at
+`/docs/token-audit`** (add `?format=json` for the raw record). It serves the policy
+plus every run and every deletion out of D1, keyed by the token's **name** — because
+once a token is deleted its name is the only handle anyone has. That page exists
+specifically so a deletion is never a mystery later.
+
+`lib/token-audit.ts` is pure bookkeeping — rules over timestamps and references, no
+model involved, which is why it is safe to run unattended. `cloudflare_token_audit`
+is **dry-run by default** and deletes nothing without `apply=true`.
+
+**It deletes only what is provably dead:**
+
+- expired (`expires_on` in the past), or
+- a non-active status, or
+- a **recognisably generated** build token (`<worker> build token`,
+  `Workers Builds - <date>`) that is unreferenced **and** idle past the retention
+  window (default 180 days).
+
+**It never deletes, and each protection exists because of a real token in the
+measured set:**
+
+| Protection | Why |
+|---|---|
+| `keep_marker` | One token is named `KEEP - wrangler d1 access`. A human marker outranks every heuristic. |
+| `in_use_by_this_server` | Deleting the credential the audit authenticates with would be self-destruction. |
+| `referenced` | Wrapped by a Workers Builds build token, so in use whatever its timestamps say. |
+| `untracked_usage` | A tunnel/DNS/certificate token authenticates a persistent connection, so a stale `last_used_on` is **not** evidence of disuse. |
+
+Anything else that is merely idle goes to **review**, never to deletion — including a
+generated token that has *never* been used, since that is ambiguous (it may belong to
+a build that has not run yet).
+
+**Measured first run (2026-10-01, dry run): 48 of 50 in use, 41 protected, 6 keep, 1
+review, 0 reclaimable.** The strict definition currently reclaims nothing, because
+every accumulated build-related user token is still wrapped by an existing build
+token. The refinement that would unlock reclaim is checking whether that build token
+is still referenced by a **live trigger** rather than merely existing — an orphaned
+build token protects a dead user token today. That is a known, deliberate
+conservatism, not an oversight.
+
+D1 writes are bounded: one run row plus one row per deletion, and tokens that were
+kept are never recorded (that would be ~48 rows per run for no benefit, and a D1
+write costs 1000x a read).
+
+### Response framing — the bug that made every local tool look broken
+
+`lib/mcp-response.ts`. Locally-served results used to be emitted with a hardcoded
+`Content-Type: application/json`, ignoring the client's `Accept`. Proxied tools came
+back in whatever framing the client negotiated, so the asymmetry was precise and
+baffling:
+
+```
+client sends  Accept: text/event-stream
+execute            -> text/event-stream   works
+workers_* (local)  -> application/json    client cannot read it
+```
+
+Two agents reported "your build tools return results missing a required field" and
+worked around it. **A `curl` that accepts both types cannot see this**, which is why
+it survived earlier testing. So: never hardcode the framing of a response we
+generate — `encodeMcpResponse` negotiates it, and `validateToolResponse` checks the
+envelope before it leaves, repairing anything invalid rather than sending it.
+
+### Automatic failure reporting
+
+`lib/failure-report.ts`. A failure an operator has to discover and report by hand is
+a failure many agents hit first. Every failure of this server's own is recorded in
+D1 (`tool_failures`) and the **first** occurrence of each distinct signature files a
+`fixit` task in colby-maestro against the `cloudflare-api-mcp reliability` plan.
+
+Three rules it follows:
+
+- **Never affects the response.** Scheduled on `waitUntil`, so the reply is already
+  on its way; every path is swallowed. Telemetry must never make a working call
+  slower or broken.
+- **Deduped, because a D1 write costs 1000x a read.** One row per signature with an
+  occurrence counter, not one row per occurrence.
+- **One task per signature, ever.** `fixit_filed_at` gates filing, so a defect that
+  fires a thousand times files one task. There is a test that plants the missing gate
+  and confirms the suite goes red.
+
+Nothing recorded holds a credential or a response body — `detail` is a short
+redacted signature.
+
+### Build log and CI/CD tool surface
+
+Several dedicated paths to a build log, so none of them needs two round trips:
+`workers_build_logs_get` (by UUID), `workers_build_logs_latest` (newest for a
+Worker, optionally filtered by branch/status/outcome — reports which build it chose
+and from how many candidates), `workers_build_logs_by_commit` (full or abbreviated
+sha; lists every match and diagnoses the newest), `workers_pr_build_logs_get` (repo
++ PR number), `workers_build_logs_search`.
+
+Configuration is fully managed: `workers_cicd_configure` sets repository, branch and
+path matchers, build/deploy/preview commands, root directory, caching and build
+token; `workers_build_tokens_list` and `workers_build_token_create` supply a token to
+associate (the wrapped API token's value is never logged, stored, or returned);
+`workers_cicd_validate` returns one pass/fail plus the reasoning for **every** check,
+pass and fail alike, with a remedy naming the tool that fixes it.
+
+**The validator's checks are semantic, not presence-only.** A deploy command that
+skips the build while no build command is set is a FAIL, because nothing would
+produce the output the deploy uploads — even though every field looks populated.
+That is the shape that would have broken `core-ai-tools`, and a presence-only
+validator passes it.
+
 ### Docs pairing (search → docs)
 When a client calls the `search` tool, the proxy also queries **Cloudflare's separate documentation MCP server** (`DOCS_MCP_URL` = `https://docs.mcp.cloudflare.com/mcp`) and appends the documentation to the search result, so the agent gets endpoint methods/payloads *and* product context from one call. Pure transforms live in `lib/docs-pairing.ts` (`detectSearchCall`, `deriveDocsQuery`, `pickDocsToolName`, `extractToolText`, `mergeDocsIntoSearch`); `mcp.ts` does the I/O:
 
@@ -401,6 +593,7 @@ pnpm run test
 
 - The pure-logic suites (`oauth-pkce`, `token-grants`) import from `src/lib/*` and cover PKCE (incl. the RFC 7636 vector), redirect allow-listing, the full grant flow (no-code bypass blocked, mandatory PKCE, single-use replay, redirect/client mismatch, refresh rotation).
 - `mcp-auth` and `inject-account-id` import from `src/pages/mcp.ts`.
+- `builds-guidance` and `upstream-auth` cover the misdiagnosis guard: path→tool routing (including the ordering trap where a log path also matches the list pattern), the measured `12006` refusal, SSE-framed bodies, idempotent description annotation, and the codes that must *not* match (`12013`, 404s, script errors). Both planted regressions — demoting the log route below the list route, and removing the idempotence guard — were confirmed to turn the suite red.
 - The CI/CD suites are pure except `cicd-leases`, which runs against a **local** D1 (`vitest.config.ts` overrides the remote `CICD_DB` binding with `d1Databases: { CICD_DB: 'test-cicd-db' }`) and applies `migrations/0001_*.sql` per test. It covers the acceptance behaviour directly: two agents holding leases, one releasing without resuming the other's work, the last release permitting a restore, idempotent re-pause, snapshot-not-overwritten-while-paused, and a stale-revision transition being rejected.
 - **Note:** the Workers pool needs `CLOUDFLARE_API_TOKEN` to start (the KV bindings are `remote: true`), so the suite does not run in a credential-less environment. The pure-logic suites can be exercised offline under a plain node vitest config.
 

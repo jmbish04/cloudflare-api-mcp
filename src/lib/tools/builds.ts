@@ -570,4 +570,189 @@ const buildLogsSearch: ToolDefinition = {
   }
 }
 
-export const buildTools: ToolDefinition[] = [buildsList, buildLogsGet, prBuildLogs, buildLogsSearch]
+/**
+ * Latest build log for a Worker, in one call.
+ *
+ * Without this, "why did my last build fail" is two round trips — list the builds,
+ * then fetch the log by UUID — and the caller has to know that builds are returned
+ * newest-first and that the newest may not be the one they mean (a failed
+ * production build sits alongside a later preview build). This resolves the build
+ * and diagnoses it together, and reports WHICH build it chose so the answer is
+ * never silently about a different build than the caller had in mind.
+ */
+const latestBuildLogs: ToolDefinition = {
+  name: 'workers_build_logs_latest',
+  title: 'Get the latest build log for a Worker',
+  description:
+    'Resolve the most recent build for a Worker and return its diagnosed log in one ' +
+    'call — no need to list builds first and then fetch by UUID. Optional filters ' +
+    'pick the latest build matching a branch, a status, or an outcome, so "the last ' +
+    'failed production build" is a single call. Always reports which build_uuid was ' +
+    'selected and how many candidates were considered, so the answer is never ' +
+    'silently about a different build than intended. Log content is never persisted.',
+  inputSchema: S.obj(
+    'Diagnose the most recent build, optionally filtered.',
+    {
+      worker_name: S.str('The Worker name (not its tag).'),
+      branch: S.str('Only consider builds for this branch, e.g. "main".'),
+      status: S.str('Only consider builds with this status, e.g. "stopped".'),
+      outcome: S.str('Only consider builds with this outcome: "success" | "failure" | "canceled".'),
+      lookback_days: S.num(`Days back from now to search. Default ${DEFAULT_LOOKBACK_DAYS}.`),
+      raw: S.bool('Return the full bounded transcript instead of an excerpt. Default false.'),
+      max_lines: S.num('Lines of excerpt when raw is false. Default 80.'),
+      include_documentation: S.bool(
+        'Query Cloudflare documentation for critical failures. Default true.'
+      )
+    },
+    ['worker_name']
+  ),
+  async handler(args, ctx) {
+    const workerName = requireString(args, 'worker_name')
+    const workerTag = await requireWorkerTag(ctx, workerName)
+    const branch = optString(args, 'branch')
+    const status = optString(args, 'status')
+    const outcome = optString(args, 'outcome')
+    const lookbackDays = optNumber(args, 'lookback_days') ?? DEFAULT_LOOKBACK_DAYS
+
+    const filters: BuildFilters = { branch, status, since: isoDaysAgo(lookbackDays) }
+    const { builds, coverage } = await collectBuilds(
+      (page) => ctx.cf.listBuildsPage(workerTag, page, BUILDS_PAGE_SIZE),
+      filters,
+      { limit: 200, maxPages: MAX_BUILD_PAGES }
+    )
+
+    // `outcome` is filtered here rather than in collectBuilds: the upstream has no
+    // outcome filter, and build_outcome is only set once a build has stopped.
+    const candidates = outcome
+      ? builds.filter((b) => (b.build_outcome ?? '').toLowerCase() === outcome.toLowerCase())
+      : builds
+
+    if (candidates.length === 0) {
+      throw new ToolError(
+        'not_found',
+        `No build matched for "${workerName}" within ${lookbackDays} days` +
+          `${branch ? ` on branch "${branch}"` : ''}` +
+          `${status ? ` with status "${status}"` : ''}` +
+          `${outcome ? ` with outcome "${outcome}"` : ''}. ` +
+          `Scanned ${coverage.buildsScanned ?? builds.length} build(s). ` +
+          `Widen lookback_days or drop a filter.`
+      )
+    }
+
+    // collectBuilds returns newest-first, so the head is the latest match.
+    const build = candidates[0]
+    const diagnosis = await fetchAndDiagnose(ctx, build, build.build_uuid, {
+      raw: optBool(args, 'raw') ?? false,
+      maxLines: Math.min(optNumber(args, 'max_lines') ?? 80, 2000),
+      includeDocs: optBool(args, 'include_documentation') ?? true,
+      workerName,
+      repository: build.build_trigger_metadata?.repo_name
+    })
+
+    return {
+      // Stated explicitly: the caller asked for "latest", and this is which one
+      // that resolved to and what it was chosen from.
+      selection: {
+        build_uuid: build.build_uuid,
+        created_on: build.created_on,
+        branch: build.build_trigger_metadata?.branch,
+        commit_hash: build.build_trigger_metadata?.commit_hash,
+        status: build.status,
+        build_outcome: build.build_outcome,
+        candidates_considered: candidates.length,
+        filters_applied: { branch, status, outcome, lookback_days: lookbackDays },
+        coverage
+      },
+      ...diagnosis
+    }
+  }
+}
+
+/**
+ * Build log for a commit sha, without the caller resolving a UUID first.
+ *
+ * The common shape of "did my commit build?" — the caller has a sha from git, not
+ * a Cloudflare build UUID. Accepts an abbreviated sha (prefix match), and when a
+ * commit produced several builds (a retry, or production plus preview) it says so
+ * and reports every match rather than silently diagnosing one of them.
+ */
+const commitBuildLogs: ToolDefinition = {
+  name: 'workers_build_logs_by_commit',
+  title: 'Get build logs for a commit',
+  description:
+    'Find the build(s) for a commit sha and return the diagnosed log for the most ' +
+    'recent one. Takes a full or abbreviated sha, so a sha straight from git works ' +
+    'with no UUID lookup. When a commit produced several builds (a retry, or ' +
+    'production alongside preview) every match is listed and the newest is ' +
+    'diagnosed. Log content is never persisted.',
+  inputSchema: S.obj(
+    'Diagnose the build for a commit.',
+    {
+      worker_name: S.str('The Worker name (not its tag).'),
+      commit: S.str('Full or abbreviated commit sha (prefix match).'),
+      lookback_days: S.num(`Days back from now to search. Default ${DEFAULT_LOOKBACK_DAYS}.`),
+      raw: S.bool('Return the full bounded transcript. Default false.'),
+      max_lines: S.num('Lines of excerpt when raw is false. Default 80.'),
+      include_documentation: S.bool('Query Cloudflare documentation. Default true.')
+    },
+    ['worker_name', 'commit']
+  ),
+  async handler(args, ctx) {
+    const workerName = requireString(args, 'worker_name')
+    const commit = requireString(args, 'commit').trim()
+    const workerTag = await requireWorkerTag(ctx, workerName)
+    const lookbackDays = optNumber(args, 'lookback_days') ?? DEFAULT_LOOKBACK_DAYS
+
+    const { builds, coverage } = await collectBuilds(
+      (page) => ctx.cf.listBuildsPage(workerTag, page, BUILDS_PAGE_SIZE),
+      { commit, since: isoDaysAgo(lookbackDays) },
+      { limit: 200, maxPages: MAX_BUILD_PAGES }
+    )
+
+    if (builds.length === 0) {
+      throw new ToolError(
+        'not_found',
+        `No build found for commit "${commit}" on "${workerName}" within ` +
+          `${lookbackDays} days. Scanned ${coverage.buildsScanned ?? 0} build(s). ` +
+          `A build may exist outside the window — widen lookback_days.`
+      )
+    }
+
+    const build = builds[0]
+    const diagnosis = await fetchAndDiagnose(ctx, build, build.build_uuid, {
+      raw: optBool(args, 'raw') ?? false,
+      maxLines: Math.min(optNumber(args, 'max_lines') ?? 80, 2000),
+      includeDocs: optBool(args, 'include_documentation') ?? true,
+      workerName,
+      repository: build.build_trigger_metadata?.repo_name
+    })
+
+    return {
+      selection: {
+        commit_queried: commit,
+        build_uuid: build.build_uuid,
+        matches: builds.map((b) => ({
+          build_uuid: b.build_uuid,
+          created_on: b.created_on,
+          branch: b.build_trigger_metadata?.branch,
+          commit_hash: b.build_trigger_metadata?.commit_hash,
+          status: b.status,
+          build_outcome: b.build_outcome
+        })),
+        // More than one match means the diagnosis below is of the newest only.
+        multiple_matches: builds.length > 1,
+        coverage
+      },
+      ...diagnosis
+    }
+  }
+}
+
+export const buildTools: ToolDefinition[] = [
+  buildsList,
+  buildLogsGet,
+  latestBuildLogs,
+  commitBuildLogs,
+  prBuildLogs,
+  buildLogsSearch
+]

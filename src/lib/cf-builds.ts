@@ -306,6 +306,23 @@ export class CloudflareBuildsClient {
     return result
   }
 
+  /**
+   * Create a build token.
+   *
+   * The API requires the *value* of a Cloudflare API token plus its id — a build
+   * token wraps an existing API token rather than minting one. The secret is
+   * passed straight through and is never logged, stored, or returned: the result
+   * carries only the build token's uuid and name (see `BuildToken`).
+   */
+  async createBuildToken(body: {
+    build_token_name: string
+    build_token_secret: string
+    cloudflare_token_id: string
+  }): Promise<BuildToken> {
+    const { result } = await this.#request<BuildToken>('POST', '/builds/tokens', { body })
+    return result
+  }
+
   async listBuildTokens(): Promise<BuildToken[]> {
     const { result } = await this.#request<BuildToken[]>('GET', '/builds/tokens')
     return result ?? []
