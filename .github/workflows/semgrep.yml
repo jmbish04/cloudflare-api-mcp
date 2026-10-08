@@ -14,7 +14,7 @@ permissions:
 jobs:
   semgrep:
     name: semgrep-oss
-    runs-on: ubuntu-slim
+    runs-on: ${{ github.event.pull_request.head.repo.full_name && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64","proxmox-actions"]') }}
     steps:
       - uses: actions/checkout@v5
         with:
