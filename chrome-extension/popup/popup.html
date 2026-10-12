@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cloudflare Worker Error Watcher</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="reui-container">
+    <!-- Header -->
+    <header class="reui-header">
+      <div class="reui-brand">
+        <div class="reui-logo-box">
+          <img src="../icons/icon-48.png" alt="Logo" class="reui-logo" />
+        </div>
+        <div class="reui-brand-info">
+          <div class="reui-brand-title">
+            <h1>CF Error Watcher</h1>
+            <span class="reui-badge reui-badge-primary-light">ReUI</span>
+          </div>
+          <p class="reui-brand-sub">Monitors *.hacolby.workers.dev & *.hacolby.app</p>
+        </div>
+      </div>
+      <div class="reui-status-box">
+        <span class="reui-badge reui-badge-success-light" id="statusBadge">
+          <span class="reui-status-dot"></span>
+          Active
+        </span>
+      </div>
+    </header>
+
+    <!-- Toolbar -->
+    <section class="reui-toolbar">
+      <div class="reui-toolbar-left">
+        <span class="reui-badge reui-badge-outline" id="errorCountBadge">0 Errors</span>
+      </div>
+      <div class="reui-toolbar-actions">
+        <button id="btnCopyAll" class="reui-btn reui-btn-primary" title="Copy all worker errors as one formatted block for AI coding agents">
+          📋 Copy All
+        </button>
+        <button id="btnTest" class="reui-btn reui-btn-secondary" title="Simulate an error on current page">
+          ⚡ Test
+        </button>
+        <button id="btnClear" class="reui-btn reui-btn-ghost" title="Clear error logs">
+          🧹
+        </button>
+        <button id="btnToggleSettings" class="reui-btn reui-btn-ghost" title="Settings">
+          ⚙️
+        </button>
+      </div>
+    </section>
+
+    <!-- Settings Drawer -->
+    <section id="settingsDrawer" class="reui-settings-drawer hidden">
+      <div class="reui-frame">
+        <div class="reui-frame-header">
+          <h3 class="reui-frame-title">Worker D1 Sync Settings</h3>
+          <p class="reui-frame-description">Configure Cloudflare D1 error reporting endpoint</p>
+        </div>
+        <div class="reui-frame-panel">
+          <div class="reui-field">
+            <label for="apiUrl">Worker API URL</label>
+            <input type="text" id="apiUrl" class="reui-input" placeholder="https://cloudflare-api-mcp.hacolby.workers.dev" />
+          </div>
+          <div class="reui-field">
+            <label for="apiKey">Worker API Key (WORKER_API_KEY)</label>
+            <input type="password" id="apiKey" class="reui-input" placeholder="WORKER_API_KEY" />
+          </div>
+          <div class="reui-field-row">
+            <label for="autoPost">Auto-POST to Cloudflare D1</label>
+            <input type="checkbox" id="autoPost" class="reui-checkbox" checked />
+          </div>
+          <div class="reui-btn-group">
+            <button id="btnTestConn" class="reui-btn reui-btn-secondary reui-btn-sm">Test Health</button>
+            <button id="btnSaveSettings" class="reui-btn reui-btn-primary reui-btn-sm">Save Config</button>
+          </div>
+          <div id="connStatus" class="reui-conn-status"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main Content / Worker Grouped Error Feed -->
+    <main class="reui-main" id="logContainer">
+      <div id="workerList" class="reui-worker-list">
+        <!-- Rendered dynamically grouped by worker -->
+      </div>
+    </main>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
