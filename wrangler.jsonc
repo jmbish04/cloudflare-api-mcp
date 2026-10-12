@@ -13,11 +13,24 @@
   // preview URL renders incorrectly. Pinning false also stops a wrangler deploy
   // from re-enabling previews. Production deploys on the main branch are unaffected.
   "preview_urls": false,
+  "placement": { "mode": "smart" },
+  "cache": { "enabled": true },
   "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "redact_query_string": false,
     "logs": {
-      "enabled": true
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
     },
     "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    },
+    "issues": {
       "enabled": true
     }
   },
