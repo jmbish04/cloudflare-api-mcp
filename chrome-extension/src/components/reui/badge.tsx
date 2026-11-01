@@ -31,8 +31,8 @@ const badgeVariants = cva(
           "border-destructive/20 bg-destructive/10 text-destructive",
       },
       size: {
-        xs: "px-1.5 py-0.25 text-[10px] leading-none h-4 min-w-4 gap-1",
-        sm: "px-2 py-0.5 text-[11px] leading-tight h-5 min-w-5 gap-1",
+        xs: "px-1.5 py-0.25 text-xs leading-none h-4 min-w-4 gap-1",
+        sm: "px-2 py-0.5 text-xs leading-tight h-5 min-w-5 gap-1",
         default: "px-2.5 py-0.5 text-xs h-5.5 min-w-5.5 gap-1.5",
         lg: "px-3 py-1 text-sm h-6 min-w-6 gap-2",
       },

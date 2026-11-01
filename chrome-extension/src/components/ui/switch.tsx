@@ -33,7 +33,7 @@ export function Switch({
             </label>
           )}
           {description && (
-            <p className="text-[11px] text-muted-foreground select-none leading-relaxed">{description}</p>
+            <p className="text-xs text-muted-foreground select-none leading-relaxed">{description}</p>
           )}
         </div>
       )}
