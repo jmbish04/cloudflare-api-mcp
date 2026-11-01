@@ -36,7 +36,7 @@ export function AppHeader({ icon, title, subtitle, tag, actions }: AppHeaderProp
               </Badge>
             )}
           </h1>
-          <p className="truncate text-[10px] text-muted-foreground">{subtitle}</p>
+          <p className="truncate text-xs text-muted-foreground">{subtitle}</p>
         </div>
       </div>
 

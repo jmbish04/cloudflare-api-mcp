@@ -56,7 +56,7 @@ function TraceBlock({ content }: { content: string }) {
   return (
     <Frame variant="inverse" spacing="dense">
       <FramePanel className="bg-muted/40 p-2">
-        <pre className="max-h-40 overflow-auto font-mono text-[10px] leading-relaxed whitespace-pre text-muted-foreground select-text">
+        <pre className="max-h-40 overflow-auto font-mono text-xs leading-relaxed whitespace-pre text-muted-foreground select-text">
           {content}
         </pre>
       </FramePanel>
@@ -92,7 +92,7 @@ function ErrorRow({ log, index }: { log: CapturedLog; index: number }) {
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <span className="font-mono text-[10px] text-muted-foreground">
+          <span className="font-mono text-xs text-muted-foreground">
             {new Date(log.timestamp || Date.now()).toLocaleTimeString()}
           </span>
           <Button
@@ -108,8 +108,8 @@ function ErrorRow({ log, index }: { log: CapturedLog; index: number }) {
         </div>
       </div>
 
-      <p className="font-mono text-[11px] leading-relaxed text-foreground">{log.message}</p>
-      <p className="truncate font-mono text-[10px] text-muted-foreground">{log.url}</p>
+      <p className="font-mono text-xs leading-relaxed text-foreground">{log.message}</p>
+      <p className="truncate font-mono text-xs text-muted-foreground">{log.url}</p>
 
       {log.stack && <TraceBlock content={log.stack} />}
     </div>
@@ -137,7 +137,7 @@ function WorkerCard({ group }: { group: WorkerGroup }) {
                 {group.logs.length} {group.logs.length === 1 ? "error" : "errors"}
               </Badge>
             </FrameTitle>
-            <FrameDescription className="truncate text-[10px]">{group.hostname}</FrameDescription>
+            <FrameDescription className="truncate text-xs">{group.hostname}</FrameDescription>
           </div>
 
           <Button
@@ -349,7 +349,7 @@ export default function Popup() {
           <Frame variant="default" spacing="dense">
             <FrameHeader className="px-3 py-2.5">
               <FrameTitle className="text-xs">Worker D1 sync</FrameTitle>
-              <FrameDescription className="text-[11px]">
+              <FrameDescription className="text-xs">
                 Where captured errors are posted, and the credential they are posted with.
               </FrameDescription>
             </FrameHeader>
@@ -387,7 +387,7 @@ export default function Popup() {
               <div className="flex items-center justify-between gap-3 border-t border-border pt-3">
                 <div>
                   <div className="text-xs font-semibold">Auto-post to Cloudflare D1</div>
-                  <div className="text-[11px] text-muted-foreground">
+                  <div className="text-xs text-muted-foreground">
                     Off keeps every capture local to this browser
                   </div>
                 </div>
