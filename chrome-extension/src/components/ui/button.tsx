@@ -22,11 +22,11 @@ const buttonVariants = cva(
       },
       size: {
         default: "h-8 px-3 py-1.5",
-        sm: "h-7 px-2.5 text-[11px]",
+        sm: "h-7 px-2.5 text-xs",
         lg: "h-9 px-4 text-sm",
         icon: "h-7 w-7 p-0",
         // Sizes the ReUI Pro blocks (ai-chat, rich-text-editor, whiteboard, settings) ask for.
-        xs: "h-6 px-2 text-[11px]",
+        xs: "h-6 px-2 text-xs",
         "icon-xs": "h-6 w-6 p-0",
         "icon-sm": "h-7 w-7 p-0",
         "icon-lg": "h-9 w-9 p-0",
