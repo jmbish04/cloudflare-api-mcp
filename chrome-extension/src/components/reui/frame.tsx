@@ -87,7 +87,7 @@ function FrameDescription({
 }: React.HTMLAttributes<HTMLParagraphElement>) {
   return (
     <p
-      className={cn("text-[11px] text-muted-foreground leading-relaxed", className)}
+      className={cn("text-xs text-muted-foreground leading-relaxed", className)}
       data-slot="frame-description"
       {...props}
     />
